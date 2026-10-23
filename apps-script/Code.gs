@@ -14,6 +14,9 @@
  * Cara pasang: lihat README.md bagian "Setup Google Apps Script".
  */
 
+// Versi kode — buka URL Web App (/exec) di browser untuk mengecek versi yang sedang aktif.
+var CODE_VERSION = '3-google-login';
+
 // ====== KONFIGURASI ======
 // OAuth Client ID (Web application) dari Google Cloud Console.
 // Harus sama dengan VITE_GOOGLE_CLIENT_ID di aplikasi. Bisa juga diisi lewat
@@ -61,7 +64,7 @@ var STATUS_LABELS = { open: 'Open', in_progress: 'In Progress', done: 'Done' };
 // ---------------------------------------------------------------------------
 
 function doGet() {
-  return json_({ ok: true, service: 'site-survey', time: new Date().toISOString() });
+  return json_({ ok: true, service: 'site-survey', version: CODE_VERSION, login: 'google', time: new Date().toISOString() });
 }
 
 function doPost(e) {
