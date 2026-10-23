@@ -1,2 +1,8 @@
+node_modules/
+dist/
+dev-dist/
+.env
+.env.local
+*.tsbuildinfo
 .playwright-mcp/
 .claude/

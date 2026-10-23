@@ -1,0 +1,664 @@
+/**
+ * Site Survey — backend Google Apps Script.
+ *
+ * Menggantikan Firestore + Cloudinary:
+ *   - Data (users, projects, plans, pins, categories) disimpan di Google Sheets
+ *     (spreadsheet tempat script ini di-bind).
+ *   - Gambar denah & foto temuan disimpan di Google Drive.
+ *   - Export laporan ke file Excel (.xlsx).
+ *
+ * Login tetap memakai Firebase Authentication. Setiap request membawa Firebase
+ * ID token yang diverifikasi lewat Identity Toolkit API.
+ *
+ * Cara pasang: lihat README.md bagian "Setup Google Apps Script".
+ */
+
+// ====== KONFIGURASI ======
+// Web API key Firebase (sama dengan apiKey di src/lib/firebase.ts).
+var FIREBASE_API_KEY = 'AIzaSyB4SLut2f8tp1lbA2UV2rVsQJC-L2SNTEk';
+// Nama folder root di Google Drive untuk menyimpan foto & denah.
+var DRIVE_ROOT_FOLDER_NAME = 'Site Survey';
+// Email yang otomatis jadi admin (opsional). User pertama yang mendaftar juga otomatis admin.
+var ADMIN_EMAILS = [];
+// ==========================
+
+var SCHEMA = {
+  users: ['id', 'email', 'displayName', 'role', 'banned', 'createdAt'],
+  projects: ['id', 'name', 'createdBy', 'memberUids', 'createdAt'],
+  plans: ['id', 'projectId', 'name', 'imageFileId', 'imageURL', 'imageWidth', 'imageHeight', 'createdBy', 'createdAt'],
+  pins: ['id', 'projectId', 'planId', 'x', 'y', 'status', 'category', 'notes', 'photoFileId', 'photoURL',
+    'createdBy', 'createdByName', 'createdAt', 'updatedAt'],
+  categories: ['id', 'name', 'color', 'createdAt'],
+};
+
+var NUMBER_FIELDS = { x: 1, y: 1, imageWidth: 1, imageHeight: 1, createdAt: 1, updatedAt: 1 };
+var BOOL_FIELDS = { banned: 1 };
+var JSON_FIELDS = { memberUids: 1 };
+
+var DEFAULT_CATEGORIES = [
+  { id: 'default-structural', name: 'Structural', color: '#2563eb' },
+  { id: 'default-electrical', name: 'Electrical', color: '#eab308' },
+  { id: 'default-plumbing', name: 'Plumbing', color: '#0891b2' },
+  { id: 'default-finishing', name: 'Finishing', color: '#9333ea' },
+  { id: 'default-other', name: 'Other', color: '#6b7280' },
+];
+
+var PIN_STATUSES = ['open', 'in_progress', 'done'];
+var STATUS_LABELS = { open: 'Open', in_progress: 'In Progress', done: 'Done' };
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+function doGet() {
+  return json_({ ok: true, service: 'site-survey', time: new Date().toISOString() });
+}
+
+function doPost(e) {
+  try {
+    var body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    var handler = ACTIONS[body.action];
+    if (!handler) throw httpError_(400, 'Unknown action: ' + body.action);
+    var auth = verifyIdToken_(body.idToken);
+    var me = ensureUser_(auth);
+    if (me.banned) throw httpError_(403, 'BANNED');
+    var data = handler(me, body.payload || {});
+    return json_({ ok: true, data: data === undefined ? null : data });
+  } catch (err) {
+    return json_({ ok: false, status: err.status || 500, error: String(err.message || err) });
+  }
+}
+
+/** Jalankan sekali dari editor Apps Script untuk membuat sheet & folder serta memberi izin. */
+function setup() {
+  Object.keys(SCHEMA).forEach(function (name) { getSheet_(name); });
+  seedCategories_();
+  getFolder_('plans');
+  getFolder_('photos');
+  Logger.log('Spreadsheet: ' + SpreadsheetApp.getActiveSpreadsheet().getUrl());
+  Logger.log('Folder Drive: ' + getRootFolder_().getUrl());
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+var ACTIONS = {
+  me: function (me) {
+    return me;
+  },
+
+  // ----- Projects -----
+  listProjects: function (me) {
+    return readAll_('projects')
+      .filter(function (p) { return p.memberUids.indexOf(me.id) !== -1; })
+      .sort(byDesc_('createdAt'));
+  },
+  createProject: function (me, p) {
+    var name = requireText_(p.name, 'name');
+    return withLock_(function () {
+      return insert_('projects', {
+        id: newId_(), name: name, createdBy: me.id, memberUids: [me.id], createdAt: Date.now(),
+      });
+    });
+  },
+  deleteProject: function (me, p) {
+    var project = requireProjectAccess_(me, p.projectId);
+    if (project.createdBy !== me.id && me.role !== 'admin') throw httpError_(403, 'Forbidden');
+    withLock_(function () { remove_('projects', project.id); });
+  },
+
+  // ----- Plans -----
+  listPlans: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    return readAll_('plans')
+      .filter(function (r) { return r.projectId === p.projectId; })
+      .sort(byDesc_('createdAt'));
+  },
+  getPlan: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    var plan = findById_('plans', p.planId);
+    if (!plan || plan.projectId !== p.projectId) throw httpError_(404, 'Plan not found');
+    return plan;
+  },
+  uploadPlan: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    var name = requireText_(p.name, 'name');
+    var id = newId_();
+    var file = saveImage_('plans', 'plan-' + id + '-' + (p.fileName || 'plan'), p.mimeType, p.base64);
+    return withLock_(function () {
+      return insert_('plans', {
+        id: id,
+        projectId: p.projectId,
+        name: name,
+        imageFileId: file.getId(),
+        imageURL: imageUrl_(file.getId()),
+        imageWidth: Number(p.width) || 0,
+        imageHeight: Number(p.height) || 0,
+        createdBy: me.id,
+        createdAt: Date.now(),
+      });
+    });
+  },
+  deletePlan: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    withLock_(function () { remove_('plans', p.planId); });
+  },
+
+  // ----- Pins -----
+  listPins: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    return readAll_('pins')
+      .filter(function (r) { return r.projectId === p.projectId && r.planId === p.planId; })
+      .sort(byAsc_('createdAt'));
+  },
+  createPin: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    var id = String(p.id || newId_());
+    return withLock_(function () {
+      var existing = findById_('pins', id);
+      if (existing) return existing; // idempotent saat sinkronisasi ulang
+      var now = Date.now();
+      return insert_('pins', {
+        id: id,
+        projectId: p.projectId,
+        planId: p.planId,
+        x: clamp01_(p.x),
+        y: clamp01_(p.y),
+        status: 'open',
+        category: 'Other',
+        notes: '',
+        photoFileId: '',
+        photoURL: '',
+        createdBy: me.id,
+        createdByName: me.email,
+        createdAt: Number(p.createdAt) || now,
+        updatedAt: now,
+      });
+    });
+  },
+  updatePin: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    var patch = {};
+    var src = p.patch || {};
+    if (src.status !== undefined) {
+      if (PIN_STATUSES.indexOf(src.status) === -1) throw httpError_(400, 'Invalid status');
+      patch.status = src.status;
+    }
+    if (src.category !== undefined) patch.category = String(src.category);
+    if (src.notes !== undefined) patch.notes = String(src.notes);
+    patch.updatedAt = Date.now();
+    return withLock_(function () { return update_('pins', p.pinId, patch); });
+  },
+  deletePin: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    withLock_(function () {
+      var pin = findById_('pins', p.pinId);
+      if (!pin) return;
+      trashFile_(pin.photoFileId);
+      remove_('pins', pin.id);
+    });
+  },
+  uploadPinPhoto: function (me, p) {
+    requireProjectAccess_(me, p.projectId);
+    var pin = findById_('pins', p.pinId);
+    if (!pin) throw httpError_(404, 'Pin not found');
+    var file = saveImage_('photos', 'pin-' + pin.id + '-' + (p.fileName || 'photo.jpg'), p.mimeType, p.base64);
+    return withLock_(function () {
+      var current = findById_('pins', pin.id);
+      if (current && current.photoFileId) trashFile_(current.photoFileId);
+      return update_('pins', pin.id, {
+        photoFileId: file.getId(),
+        photoURL: imageUrl_(file.getId()),
+        updatedAt: Date.now(),
+      });
+    });
+  },
+
+  // ----- Categories -----
+  listCategories: function () {
+    seedCategories_();
+    return readAll_('categories').sort(function (a, b) { return a.name.localeCompare(b.name); });
+  },
+  createCategory: function (me, p) {
+    requireAdmin_(me);
+    var name = requireText_(p.name, 'name');
+    return withLock_(function () {
+      return insert_('categories', { id: newId_(), name: name, color: String(p.color || '#6b7280'), createdAt: Date.now() });
+    });
+  },
+  updateCategory: function (me, p) {
+    requireAdmin_(me);
+    var patch = {};
+    if (p.patch && p.patch.name !== undefined) patch.name = requireText_(p.patch.name, 'name');
+    if (p.patch && p.patch.color !== undefined) patch.color = String(p.patch.color);
+    return withLock_(function () { return update_('categories', p.categoryId, patch); });
+  },
+  deleteCategory: function (me, p) {
+    requireAdmin_(me);
+    withLock_(function () { remove_('categories', p.categoryId); });
+  },
+
+  // ----- Admin -----
+  adminListUsers: function (me) {
+    requireAdmin_(me);
+    return readAll_('users').filter(function (u) { return !u.banned; }).sort(byDesc_('createdAt'));
+  },
+  adminSetUserRole: function (me, p) {
+    requireAdmin_(me);
+    if (p.role !== 'admin' && p.role !== 'member') throw httpError_(400, 'Invalid role');
+    return withLock_(function () { return update_('users', p.userId, { role: p.role }); });
+  },
+  adminBanUser: function (me, p) {
+    requireAdmin_(me);
+    if (p.userId === me.id) throw httpError_(400, 'Tidak bisa menghapus akun sendiri');
+    return withLock_(function () { return update_('users', p.userId, { banned: true, role: 'member' }); });
+  },
+  adminListProjects: function (me) {
+    requireAdmin_(me);
+    return readAll_('projects').sort(byDesc_('createdAt'));
+  },
+  adminRenameProject: function (me, p) {
+    requireAdmin_(me);
+    var name = requireText_(p.name, 'name');
+    return withLock_(function () { return update_('projects', p.projectId, { name: name }); });
+  },
+  adminDeleteProject: function (me, p) {
+    requireAdmin_(me);
+    withLock_(function () { remove_('projects', p.projectId); });
+  },
+  adminListPhotos: function (me) {
+    requireAdmin_(me);
+    return readAll_('pins').filter(function (r) { return !!r.photoURL; }).sort(byDesc_('createdAt'));
+  },
+  adminDeletePhoto: function (me, p) {
+    requireAdmin_(me);
+    return withLock_(function () {
+      var pin = findById_('pins', p.pinId);
+      if (!pin) throw httpError_(404, 'Pin not found');
+      trashFile_(pin.photoFileId);
+      return update_('pins', pin.id, { photoFileId: '', photoURL: '', updatedAt: Date.now() });
+    });
+  },
+  adminStorageStats: function (me) {
+    requireAdmin_(me);
+    var folder = getRootFolder_();
+    var stats = { files: 0, bytes: 0 };
+    countFolder_(folder, stats);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    return {
+      driveUsed: DriveApp.getStorageUsed(),
+      driveLimit: DriveApp.getStorageLimit(),
+      appFiles: stats.files,
+      appBytes: stats.bytes,
+      folderUrl: folder.getUrl(),
+      spreadsheetUrl: ss.getUrl(),
+      users: readAll_('users').filter(function (u) { return !u.banned; }).length,
+      projects: readAll_('projects').length,
+      plans: readAll_('plans').length,
+      pins: readAll_('pins').length,
+      photos: readAll_('pins').filter(function (r) { return !!r.photoURL; }).length,
+      lastUpdated: Date.now(),
+    };
+  },
+
+  // ----- Excel -----
+  exportExcel: function (me, p) {
+    var projects = readAll_('projects');
+    var allowed = projects.filter(function (pr) {
+      return me.role === 'admin' || pr.memberUids.indexOf(me.id) !== -1;
+    });
+    if (p.projectId) {
+      allowed = allowed.filter(function (pr) { return pr.id === p.projectId; });
+      if (!allowed.length) throw httpError_(403, 'Forbidden');
+    } else if (me.role !== 'admin') {
+      throw httpError_(403, 'Forbidden');
+    }
+    return buildExcel_(allowed, p.planId || null);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Excel export
+// ---------------------------------------------------------------------------
+
+function buildExcel_(projects, planId) {
+  var projectById = {};
+  projects.forEach(function (pr) { projectById[pr.id] = pr; });
+  var plans = readAll_('plans').filter(function (pl) {
+    return projectById[pl.projectId] && (!planId || pl.id === planId);
+  });
+  var planById = {};
+  plans.forEach(function (pl) { planById[pl.id] = pl; });
+  var pins = readAll_('pins')
+    .filter(function (pin) { return planById[pin.planId]; })
+    .sort(function (a, b) {
+      return a.projectId.localeCompare(b.projectId) || a.planId.localeCompare(b.planId) || a.createdAt - b.createdAt;
+    });
+
+  var tz = Session.getScriptTimeZone();
+  var fmt = function (ms) { return ms ? Utilities.formatDate(new Date(ms), tz, 'yyyy-MM-dd HH:mm') : ''; };
+
+  var tmp = SpreadsheetApp.create('Site Survey Export ' + Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HHmm'));
+  try {
+    // Sheet 1: Punch List
+    var sh = tmp.getSheets()[0];
+    sh.setName('Punch List');
+    var header = ['No', 'Proyek', 'Denah', 'Kategori', 'Status', 'Catatan', 'Dibuat oleh',
+      'Dibuat', 'Diperbarui', 'Posisi X (%)', 'Posisi Y (%)', 'Foto'];
+    var rows = pins.map(function (pin, i) {
+      return [
+        i + 1,
+        projectById[pin.projectId].name,
+        planById[pin.planId].name,
+        pin.category,
+        STATUS_LABELS[pin.status] || pin.status,
+        pin.notes,
+        pin.createdByName,
+        fmt(pin.createdAt),
+        fmt(pin.updatedAt),
+        Math.round(pin.x * 1000) / 10,
+        Math.round(pin.y * 1000) / 10,
+        pin.photoFileId ? '=HYPERLINK("https://drive.google.com/file/d/' + pin.photoFileId + '/view","Lihat foto")' : '',
+      ];
+    });
+    writeSheet_(sh, header, rows);
+
+    // Sheet 2: Ringkasan per denah
+    var sum = tmp.insertSheet('Ringkasan');
+    var sumRows = plans.map(function (pl) {
+      var own = pins.filter(function (pin) { return pin.planId === pl.id; });
+      var count = function (s) { return own.filter(function (pin) { return pin.status === s; }).length; };
+      return [projectById[pl.projectId].name, pl.name, own.length, count('open'), count('in_progress'), count('done')];
+    });
+    writeSheet_(sum, ['Proyek', 'Denah', 'Total Temuan', 'Open', 'In Progress', 'Done'], sumRows);
+
+    SpreadsheetApp.flush();
+    var url = 'https://docs.google.com/spreadsheets/d/' + tmp.getId() + '/export?format=xlsx';
+    var resp = UrlFetchApp.fetch(url, {
+      headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+      muteHttpExceptions: true,
+    });
+    if (resp.getResponseCode() !== 200) throw httpError_(500, 'Export Excel gagal (' + resp.getResponseCode() + ')');
+
+    var label = planId && plans[0] ? plans[0].name : projects.length === 1 ? projects[0].name : 'Semua';
+    var fileName = 'Site-Survey_' + label.replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-') + '_' +
+      Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmm') + '.xlsx';
+    return { fileName: fileName, base64: Utilities.base64Encode(resp.getBlob().getBytes()), rows: rows.length };
+  } finally {
+    DriveApp.getFileById(tmp.getId()).setTrashed(true);
+  }
+}
+
+function writeSheet_(sheet, header, rows) {
+  var values = [header].concat(rows.map(function (r) {
+    return r.map(function (v) {
+      return typeof v === 'string' && v.charAt(0) !== '=' ? safeText_(v) : v;
+    });
+  }));
+  sheet.getRange(1, 1, values.length, header.length).setValues(values);
+  sheet.getRange(1, 1, 1, header.length).setFontWeight('bold').setBackground('#0f172a').setFontColor('#ffffff');
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, header.length);
+}
+
+// ---------------------------------------------------------------------------
+// Auth & users
+// ---------------------------------------------------------------------------
+
+function verifyIdToken_(idToken) {
+  if (!idToken) throw httpError_(401, 'Unauthorized');
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, idToken);
+  var cacheKey = 'tok_' + Utilities.base64EncodeWebSafe(digest);
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get(cacheKey);
+  if (cached) return JSON.parse(cached);
+
+  var resp = UrlFetchApp.fetch(
+    'https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' + FIREBASE_API_KEY,
+    { method: 'post', contentType: 'application/json', payload: JSON.stringify({ idToken: idToken }), muteHttpExceptions: true }
+  );
+  if (resp.getResponseCode() !== 200) throw httpError_(401, 'Unauthorized');
+  var user = (JSON.parse(resp.getContentText()).users || [])[0];
+  if (!user) throw httpError_(401, 'Unauthorized');
+  var auth = { uid: user.localId, email: user.email || '' };
+  cache.put(cacheKey, JSON.stringify(auth), 600);
+  return auth;
+}
+
+function ensureUser_(auth) {
+  var user = findById_('users', auth.uid);
+  if (user) return user;
+  return withLock_(function () {
+    var again = findById_('users', auth.uid);
+    if (again) return again;
+    var isFirst = readAll_('users').length === 0;
+    var isAdmin = isFirst || ADMIN_EMAILS.indexOf(auth.email) !== -1;
+    return insert_('users', {
+      id: auth.uid,
+      email: auth.email,
+      displayName: auth.email.split('@')[0],
+      role: isAdmin ? 'admin' : 'member',
+      banned: false,
+      createdAt: Date.now(),
+    });
+  });
+}
+
+function requireAdmin_(me) {
+  if (me.role !== 'admin') throw httpError_(403, 'Forbidden');
+}
+
+function requireProjectAccess_(me, projectId) {
+  var project = findById_('projects', projectId);
+  if (!project) throw httpError_(404, 'Project not found');
+  if (me.role !== 'admin' && project.memberUids.indexOf(me.id) === -1) throw httpError_(403, 'Forbidden');
+  return project;
+}
+
+// ---------------------------------------------------------------------------
+// Google Drive
+// ---------------------------------------------------------------------------
+
+function getRootFolder_() {
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('DRIVE_ROOT_FOLDER_ID');
+  if (id) {
+    try { return DriveApp.getFolderById(id); } catch (e) { /* folder dihapus, buat ulang */ }
+  }
+  var folder = DriveApp.createFolder(DRIVE_ROOT_FOLDER_NAME);
+  props.setProperty('DRIVE_ROOT_FOLDER_ID', folder.getId());
+  return folder;
+}
+
+function getFolder_(name) {
+  var root = getRootFolder_();
+  var it = root.getFoldersByName(name);
+  return it.hasNext() ? it.next() : root.createFolder(name);
+}
+
+function saveImage_(folderName, fileName, mimeType, base64) {
+  if (!base64) throw httpError_(400, 'File kosong');
+  var type = String(mimeType || 'image/jpeg');
+  if (type.indexOf('image/') !== 0) throw httpError_(400, 'Hanya file gambar yang diizinkan');
+  var blob = Utilities.newBlob(Utilities.base64Decode(base64), type, String(fileName).slice(0, 150));
+  var file = getFolder_(folderName).createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  return file;
+}
+
+function trashFile_(fileId) {
+  if (!fileId) return;
+  try { DriveApp.getFileById(fileId).setTrashed(true); } catch (e) { /* sudah terhapus */ }
+}
+
+function imageUrl_(fileId) {
+  return 'https://drive.google.com/thumbnail?id=' + fileId + '&sz=w2000';
+}
+
+function countFolder_(folder, stats) {
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var f = files.next();
+    if (f.isTrashed()) continue;
+    stats.files++;
+    stats.bytes += f.getSize();
+  }
+  var subs = folder.getFolders();
+  while (subs.hasNext()) countFolder_(subs.next(), stats);
+}
+
+// ---------------------------------------------------------------------------
+// Google Sheets "database"
+// ---------------------------------------------------------------------------
+
+function getSheet_(name) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(name);
+  var headers = SCHEMA[name];
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function readAll_(name) {
+  var sheet = getSheet_(name);
+  var headers = SCHEMA[name];
+  var last = sheet.getLastRow();
+  if (last < 2) return [];
+  var values = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+  var out = [];
+  for (var i = 0; i < values.length; i++) {
+    if (values[i][0] === '') continue;
+    out.push(fromRow_(headers, values[i]));
+  }
+  return out;
+}
+
+function findRowIndex_(name, id) {
+  var sheet = getSheet_(name);
+  var last = sheet.getLastRow();
+  if (last < 2 || !id) return -1;
+  var ids = sheet.getRange(2, 1, last - 1, 1).getValues();
+  for (var i = 0; i < ids.length; i++) {
+    if (String(ids[i][0]) === String(id)) return i + 2;
+  }
+  return -1;
+}
+
+function findById_(name, id) {
+  var row = findRowIndex_(name, id);
+  if (row === -1) return null;
+  var headers = SCHEMA[name];
+  return fromRow_(headers, getSheet_(name).getRange(row, 1, 1, headers.length).getValues()[0]);
+}
+
+function insert_(name, obj) {
+  var headers = SCHEMA[name];
+  getSheet_(name).appendRow(toRow_(headers, obj));
+  return obj;
+}
+
+function update_(name, id, patch) {
+  var row = findRowIndex_(name, id);
+  if (row === -1) throw httpError_(404, name + ' not found');
+  var headers = SCHEMA[name];
+  var range = getSheet_(name).getRange(row, 1, 1, headers.length);
+  var current = fromRow_(headers, range.getValues()[0]);
+  Object.keys(patch).forEach(function (k) { if (k !== 'id') current[k] = patch[k]; });
+  range.setValues([toRow_(headers, current)]);
+  return current;
+}
+
+function remove_(name, id) {
+  var row = findRowIndex_(name, id);
+  if (row !== -1) getSheet_(name).deleteRow(row);
+}
+
+function toRow_(headers, obj) {
+  return headers.map(function (h) {
+    var v = obj[h];
+    if (v === undefined || v === null) return '';
+    if (JSON_FIELDS[h]) return safeText_(JSON.stringify(v));
+    if (typeof v === 'string') return safeText_(v);
+    return v;
+  });
+}
+
+function fromRow_(headers, row) {
+  var obj = {};
+  headers.forEach(function (h, i) {
+    var v = row[i];
+    if (NUMBER_FIELDS[h]) obj[h] = v === '' ? 0 : Number(v);
+    else if (BOOL_FIELDS[h]) obj[h] = v === true || v === 'TRUE' || v === 'true';
+    else if (JSON_FIELDS[h]) obj[h] = v ? JSON.parse(v) : [];
+    else obj[h] = v === '' || v === null ? '' : String(v);
+  });
+  return obj;
+}
+
+/** Awalan apostrof memaksa Sheets menyimpan teks apa adanya (mencegah formula injection & konversi angka). */
+function safeText_(s) {
+  return s === '' ? '' : "'" + s;
+}
+
+function seedCategories_() {
+  if (getSheet_('categories').getLastRow() >= 2) return;
+  withLock_(function () {
+    if (getSheet_('categories').getLastRow() >= 2) return;
+    DEFAULT_CATEGORIES.forEach(function (c) {
+      insert_('categories', { id: c.id, name: c.name, color: c.color, createdAt: Date.now() });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Utils
+// ---------------------------------------------------------------------------
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function httpError_(status, message) {
+  var err = new Error(message);
+  err.status = status;
+  return err;
+}
+
+function newId_() {
+  return Utilities.getUuid().replace(/-/g, '').slice(0, 20);
+}
+
+function requireText_(v, field) {
+  var s = String(v === undefined || v === null ? '' : v).trim();
+  if (!s) throw httpError_(400, field + ' wajib diisi');
+  return s.slice(0, 500);
+}
+
+function clamp01_(n) {
+  n = Number(n);
+  if (isNaN(n)) return 0;
+  return Math.min(1, Math.max(0, n));
+}
+
+function byDesc_(key) {
+  return function (a, b) { return (b[key] || 0) - (a[key] || 0); };
+}
+
+function byAsc_(key) {
+  return function (a, b) { return (a[key] || 0) - (b[key] || 0); };
+}

@@ -1,0 +1,89 @@
+import { useState } from 'react'
+import { Link } from 'react-router'
+import { useProjects } from '../hooks/data'
+import { useTranslation } from '../i18n'
+
+export function ProjectsPage() {
+  const { projects, loading, error, createProject, deleteProject } = useProjects()
+  const { t } = useTranslation()
+  const [showForm, setShowForm] = useState(false)
+  const [name, setName] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const onDelete = async (id: string, projectName: string) => {
+    if (!window.confirm(t('projects.deleteConfirm', { name: projectName }))) return
+    try {
+      await deleteProject(id)
+    } catch (e) {
+      window.alert(t('error.generic', { error: (e as Error).message }))
+    }
+  }
+
+  return (
+    <div className="p-4">
+      <div className="mb-4 flex items-center justify-between">
+        <h1 className="text-xl font-bold text-slate-900">{t('projects.title')}</h1>
+        <button
+          type="button"
+          onClick={() => setShowForm((v) => !v)}
+          className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white"
+        >
+          {t('projects.new')}
+        </button>
+      </div>
+      {showForm && (
+        <div className="mb-4 flex gap-2 rounded-lg border border-slate-200 p-3">
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder={t('projects.namePlaceholder')}
+            className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-base focus:border-slate-900 focus:outline-none"
+          />
+          <button
+            type="button"
+            disabled={saving}
+            onClick={async () => {
+              if (!name.trim()) return
+              setSaving(true)
+              try {
+                await createProject(name.trim())
+                setName('')
+                setShowForm(false)
+              } catch (e) {
+                window.alert(t('error.generic', { error: (e as Error).message }))
+              } finally {
+                setSaving(false)
+              }
+            }}
+            className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+          >
+            {t('projects.save')}
+          </button>
+        </div>
+      )}
+      {loading && <p className="text-sm text-slate-500">{t('app.loading')}</p>}
+      {error && !loading && projects.length === 0 && (
+        <p className="mb-2 text-sm text-red-600">{t('error.generic', { error: error.message })}</p>
+      )}
+      {!loading && !error && projects.length === 0 && <p className="text-sm text-slate-500">{t('projects.empty')}</p>}
+      <ul className="space-y-2">
+        {projects.map((p) => (
+          <li key={p.id} className="flex items-center gap-2 rounded-lg border border-slate-200">
+            <Link to={`/projects/${p.id}`} className="flex-1 p-4 active:bg-slate-50">
+              <span className="font-semibold text-slate-900">{p.name}</span>
+            </Link>
+            <button
+              type="button"
+              onClick={() => onDelete(p.id, p.name)}
+              aria-label={t('projects.delete')}
+              className="mr-3 shrink-0 rounded-lg border border-red-300 px-2 py-1.5 text-xs font-medium text-red-600"
+            >
+              🗑
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
