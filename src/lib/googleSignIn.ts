@@ -1,5 +1,7 @@
 /** Google Identity Services ("Masuk dengan Google"). */
-export const GOOGLE_CLIENT_ID = (import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined) ?? ''
+// Client ID bersifat publik (bukan rahasia); bisa ditimpa lewat VITE_GOOGLE_CLIENT_ID.
+export const GOOGLE_CLIENT_ID =
+  (import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined) || '240395032173-vi789j2m350igme7j849r72v5s2vghoa.apps.googleusercontent.com'
 
 interface GoogleId {
   initialize(config: {

@@ -29,7 +29,7 @@ Setiap perubahan temuan (pin) dan foto langsung tampil di layar, lalu dikirim ke
 
 1. Buat **Google Spreadsheet** baru (misalnya "Site Survey DB").
 2. Buka **Extensions → Apps Script**.
-3. Ganti isi `Code.gs` dengan isi file [`apps-script/Code.gs`](apps-script/Code.gs), lalu isi `GOOGLE_CLIENT_ID` di bagian atas dengan Client ID dari langkah 1.
+3. Ganti isi `Code.gs` dengan isi file [`apps-script/Code.gs`](apps-script/Code.gs). `GOOGLE_CLIENT_ID` sudah terisi dengan Client ID project VISIONSITE; ganti kalau memakai Client ID lain.
 4. Klik ⚙️ **Project Settings**, centang **Show "appsscript.json" manifest file in editor**, lalu ganti isi `appsscript.json` dengan [`apps-script/appsscript.json`](apps-script/appsscript.json).
 5. Di editor, pilih fungsi `setup`, lalu klik **Run**. Berikan izin yang diminta (Sheets, Drive, external request).
    Fungsi ini membuat sheet `users`, `sessions`, `projects`, `plans`, `pins`, `categories` serta folder **Site Survey** di Google Drive.

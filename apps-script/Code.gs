@@ -18,7 +18,7 @@
 // OAuth Client ID (Web application) dari Google Cloud Console.
 // Harus sama dengan VITE_GOOGLE_CLIENT_ID di aplikasi. Bisa juga diisi lewat
 // Project Settings → Script properties dengan nama GOOGLE_CLIENT_ID.
-var GOOGLE_CLIENT_ID = '';
+var GOOGLE_CLIENT_ID = '240395032173-vi789j2m350igme7j849r72v5s2vghoa.apps.googleusercontent.com';
 // Lama sesi login (hari).
 var SESSION_DAYS = 30;
 // Nama folder root di Google Drive untuk menyimpan foto & denah.
