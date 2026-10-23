@@ -3,7 +3,7 @@ import { useAuth } from '../../store/auth'
 import { useTranslation } from '../../i18n'
 
 export function AdminUsersPage() {
-  const { users, loading, setUserRole, deleteUser } = useAdminUsers()
+  const { users, loading, setUserRole, resetPassword, deleteUser } = useAdminUsers()
   const me = useAuth((s) => s.user)
   const { t } = useTranslation()
   if (loading) return <p className="p-4 text-sm text-slate-500">{t('app.loading')}</p>
@@ -23,14 +23,28 @@ export function AdminUsersPage() {
                 {u.role === 'admin' ? t('adminUsers.roleAdmin') : t('adminUsers.roleMember')}
               </p>
             </div>
-            {u.id !== me?.uid && (
-              <div className="flex shrink-0 gap-2">
+            {u.id !== me?.id && (
+              <div className="flex shrink-0 flex-wrap justify-end gap-2">
                 <button
                   type="button"
                   onClick={() => run(() => setUserRole(u.id, u.role === 'admin' ? 'member' : 'admin'))}
                   className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700"
                 >
                   {u.role === 'admin' ? t('adminUsers.makeMember') : t('adminUsers.makeAdmin')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const pw = window.prompt(t('adminUsers.resetPrompt', { email: u.email }))
+                    if (pw)
+                      run(async () => {
+                        await resetPassword(u.id, pw)
+                        window.alert(t('adminUsers.resetDone', { email: u.email }))
+                      })
+                  }}
+                  className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700"
+                >
+                  {t('adminUsers.resetPassword')}
                 </button>
                 <button
                   type="button"

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Navigate, useNavigate } from 'react-router'
 import { useAuth } from '../store/auth'
-import { useTranslation } from '../i18n'
+import { useTranslation, type TKey } from '../i18n'
 import { LanguageToggle } from '../components/LanguageToggle'
 
 interface FormValues {
@@ -28,6 +28,9 @@ export function LoginPage() {
   } = useForm<FormValues>()
 
   if (!initializing && user) return <Navigate to="/" replace />
+
+  const errorKey = `login.err.${error}` as TKey
+  const errorText = error ? (t(errorKey) === errorKey ? error : t(errorKey)) : null
 
   const inputClass =
     'w-full rounded-lg border border-slate-300 px-4 py-3 text-base focus:border-slate-900 focus:outline-none'
@@ -81,7 +84,7 @@ export function LoginPage() {
             />
             {errors.password && <p className="mt-1 text-sm text-red-600">{errors.password.message}</p>}
           </div>
-          {error && <p className="text-sm text-red-600">{error}</p>}
+          {errorText && <p className="text-sm text-red-600">{errorText}</p>}
           <button
             type="submit"
             disabled={processing}

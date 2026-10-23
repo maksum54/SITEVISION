@@ -7,12 +7,12 @@ Aplikasi PWA untuk survei lokasi konstruksi: buat proyek, unggah denah (gambar/P
 | Bagian | Teknologi |
 | --- | --- |
 | Frontend | React 19 + Vite + Tailwind CSS 4 (PWA, bisa dipasang di HP) |
-| Login | Firebase Authentication (email & password) |
+| Login | Akun email & password di Google Sheets, lewat Google Apps Script |
 | Database | **Google Sheets**, lewat Google Apps Script (`apps-script/Code.gs`) |
 | Penyimpanan foto & denah | **Google Drive**, lewat Google Apps Script |
 | Laporan | **Export Excel (.xlsx)**, dibuat oleh Google Apps Script |
 
-Firestore dan Cloudinary **tidak dipakai lagi**.
+Firebase (Auth & Firestore) dan Cloudinary **tidak dipakai lagi**.
 
 Setiap perubahan temuan (pin) dan foto langsung tampil di layar, lalu dikirim ke Apps Script di latar belakang. Saat offline, perubahan disimpan di perangkat (IndexedDB) dan dikirim otomatis begitu online lagi.
 
@@ -23,7 +23,7 @@ Setiap perubahan temuan (pin) dan foto langsung tampil di layar, lalu dikirim ke
 3. Ganti isi `Code.gs` dengan isi file [`apps-script/Code.gs`](apps-script/Code.gs).
 4. Klik ⚙️ **Project Settings**, centang **Show "appsscript.json" manifest file in editor**, lalu ganti isi `appsscript.json` dengan [`apps-script/appsscript.json`](apps-script/appsscript.json).
 5. Di editor, pilih fungsi `setup`, lalu klik **Run**. Berikan izin yang diminta (Sheets, Drive, external request).
-   Fungsi ini membuat sheet `users`, `projects`, `plans`, `pins`, `categories` serta folder **Site Survey** di Google Drive.
+   Fungsi ini membuat sheet `users`, `sessions`, `projects`, `plans`, `pins`, `categories` serta folder **Site Survey** di Google Drive.
 6. Klik **Deploy → New deployment** → tipe **Web app**:
    - *Execute as*: **Me**
    - *Who has access*: **Anyone**
@@ -33,7 +33,9 @@ Setiap perubahan temuan (pin) dan foto langsung tampil di layar, lalu dikirim ke
 
 **Admin:** user pertama yang mendaftar otomatis menjadi admin. Email admin lain bisa ditambahkan di `ADMIN_EMAILS` pada `Code.gs`, atau dari menu **Admin → Users** di aplikasi.
 
-**Keamanan:** semua request membawa Firebase ID token yang diverifikasi oleh Apps Script. Kalau API key Firebase dibatasi dengan *HTTP referrer*, tambahkan pengecualian supaya Identity Toolkit API tetap bisa dipanggil dari server Google.
+**Login & keamanan:** password disimpan dalam bentuk hash (salt + HMAC-SHA256 berulang), tidak pernah dalam teks asli. Setiap login menghasilkan token sesi (berlaku 30 hari) yang disimpan dalam bentuk hash di sheet `sessions`. Login dikunci 10 menit setelah 10 kali gagal. Admin bisa **Reset Password** dan **menonaktifkan** user dari menu **Admin → Users**.
+
+> Akun lama di Firebase Authentication tidak ikut pindah. Semua user perlu **Daftar** ulang sekali di aplikasi.
 
 ## Menjalankan aplikasi
 
@@ -57,7 +59,8 @@ Environment variable lama `CLOUDINARY_*` bisa dihapus dari Vercel.
 
 | Sheet | Isi |
 | --- | --- |
-| `users` | email, role (`admin`/`member`), status nonaktif |
+| `users` | email, role (`admin`/`member`), status nonaktif, hash password |
+| `sessions` | sesi login aktif (hash token) |
 | `projects` | nama proyek, pembuat, anggota |
 | `plans` | denah per proyek + ID file Google Drive |
 | `pins` | temuan: posisi, status, kategori, catatan, foto (ID file Drive) |

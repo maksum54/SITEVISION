@@ -7,15 +7,16 @@
  *   - Gambar denah & foto temuan disimpan di Google Drive.
  *   - Export laporan ke file Excel (.xlsx).
  *
- * Login tetap memakai Firebase Authentication. Setiap request membawa Firebase
- * ID token yang diverifikasi lewat Identity Toolkit API.
+ * Login juga ditangani di sini (tanpa Firebase): akun disimpan di sheet "users"
+ * dengan password ter-hash (salt + SHA-256 berulang), dan setiap login
+ * menghasilkan token sesi yang disimpan (dalam bentuk hash) di sheet "sessions".
  *
  * Cara pasang: lihat README.md bagian "Setup Google Apps Script".
  */
 
 // ====== KONFIGURASI ======
-// Web API key Firebase (sama dengan apiKey di src/lib/firebase.ts).
-var FIREBASE_API_KEY = 'AIzaSyB4SLut2f8tp1lbA2UV2rVsQJC-L2SNTEk';
+// Lama sesi login (hari).
+var SESSION_DAYS = 30;
 // Nama folder root di Google Drive untuk menyimpan foto & denah.
 var DRIVE_ROOT_FOLDER_NAME = 'Site Survey';
 // Email yang otomatis jadi admin (opsional). User pertama yang mendaftar juga otomatis admin.
@@ -23,7 +24,8 @@ var ADMIN_EMAILS = [];
 // ==========================
 
 var SCHEMA = {
-  users: ['id', 'email', 'displayName', 'role', 'banned', 'createdAt'],
+  users: ['id', 'email', 'displayName', 'role', 'banned', 'createdAt', 'passwordHash', 'passwordSalt'],
+  sessions: ['id', 'userId', 'createdAt', 'expiresAt'],
   projects: ['id', 'name', 'createdBy', 'memberUids', 'createdAt'],
   plans: ['id', 'projectId', 'name', 'imageFileId', 'imageURL', 'imageWidth', 'imageHeight', 'createdBy', 'createdAt'],
   pins: ['id', 'projectId', 'planId', 'x', 'y', 'status', 'category', 'notes', 'photoFileId', 'photoURL',
@@ -31,7 +33,7 @@ var SCHEMA = {
   categories: ['id', 'name', 'color', 'createdAt'],
 };
 
-var NUMBER_FIELDS = { x: 1, y: 1, imageWidth: 1, imageHeight: 1, createdAt: 1, updatedAt: 1 };
+var NUMBER_FIELDS = { x: 1, y: 1, imageWidth: 1, imageHeight: 1, createdAt: 1, updatedAt: 1, expiresAt: 1 };
 var BOOL_FIELDS = { banned: 1 };
 var JSON_FIELDS = { memberUids: 1 };
 
@@ -57,12 +59,12 @@ function doGet() {
 function doPost(e) {
   try {
     var body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    var publicHandler = PUBLIC_ACTIONS[body.action];
+    if (publicHandler) return json_({ ok: true, data: publicHandler(body.payload || {}) });
     var handler = ACTIONS[body.action];
     if (!handler) throw httpError_(400, 'Unknown action: ' + body.action);
-    var auth = verifyIdToken_(body.idToken);
-    var me = ensureUser_(auth);
-    if (me.banned) throw httpError_(403, 'BANNED');
-    var data = handler(me, body.payload || {});
+    var me = authenticate_(body.token);
+    var data = handler(me, body.payload || {}, body.token);
     return json_({ ok: true, data: data === undefined ? null : data });
   } catch (err) {
     return json_({ ok: false, status: err.status || 500, error: String(err.message || err) });
@@ -83,9 +85,65 @@ function setup() {
 // Actions
 // ---------------------------------------------------------------------------
 
+// Action tanpa login
+var PUBLIC_ACTIONS = {
+  register: function (p) {
+    var email = normalizeEmail_(p.email);
+    var password = String(p.password || '');
+    if (password.length < 6) throw httpError_(400, 'WEAK_PASSWORD');
+    var user = withLock_(function () {
+      if (findUserByEmail_(email)) throw httpError_(409, 'EMAIL_IN_USE');
+      var isFirst = readAll_('users').length === 0;
+      var salt = newId_();
+      return insert_('users', {
+        id: newId_(),
+        email: email,
+        displayName: email.split('@')[0],
+        role: isFirst || ADMIN_EMAILS.indexOf(email) !== -1 ? 'admin' : 'member',
+        banned: false,
+        createdAt: Date.now(),
+        passwordHash: hashPassword_(password, salt),
+        passwordSalt: salt,
+      });
+    });
+    return { token: createSession_(user.id), user: publicUser_(user) };
+  },
+  login: function (p) {
+    var email = normalizeEmail_(p.email);
+    var cache = CacheService.getScriptCache();
+    var attemptsKey = 'login_fail_' + Utilities.base64EncodeWebSafe(email);
+    var attempts = Number(cache.get(attemptsKey) || 0);
+    if (attempts >= 10) throw httpError_(429, 'TOO_MANY_ATTEMPTS');
+    var user = findUserByEmail_(email);
+    if (!user || !user.passwordHash || hashPassword_(String(p.password || ''), user.passwordSalt) !== user.passwordHash) {
+      cache.put(attemptsKey, String(attempts + 1), 600);
+      throw httpError_(401, 'INVALID_CREDENTIALS');
+    }
+    if (user.banned) throw httpError_(403, 'BANNED');
+    cache.remove(attemptsKey);
+    return { token: createSession_(user.id), user: publicUser_(user) };
+  },
+};
+
 var ACTIONS = {
   me: function (me) {
     return me;
+  },
+  logout: function (me, p, token) {
+    var id = hashToken_(token);
+    CacheService.getScriptCache().remove('sess_' + id);
+    withLock_(function () { remove_('sessions', id); });
+  },
+  changePassword: function (me, p) {
+    var user = findById_('users', me.id);
+    if (hashPassword_(String(p.oldPassword || ''), user.passwordSalt) !== user.passwordHash) {
+      throw httpError_(401, 'INVALID_CREDENTIALS');
+    }
+    if (String(p.newPassword || '').length < 6) throw httpError_(400, 'WEAK_PASSWORD');
+    var salt = newId_();
+    withLock_(function () {
+      update_('users', me.id, { passwordHash: hashPassword_(String(p.newPassword), salt), passwordSalt: salt });
+    });
   },
 
   // ----- Projects -----
@@ -242,17 +300,29 @@ var ACTIONS = {
   // ----- Admin -----
   adminListUsers: function (me) {
     requireAdmin_(me);
-    return readAll_('users').filter(function (u) { return !u.banned; }).sort(byDesc_('createdAt'));
+    return readAll_('users').filter(function (u) { return !u.banned; }).map(publicUser_).sort(byDesc_('createdAt'));
+  },
+  adminResetPassword: function (me, p) {
+    requireAdmin_(me);
+    if (String(p.newPassword || '').length < 6) throw httpError_(400, 'WEAK_PASSWORD');
+    var salt = newId_();
+    withLock_(function () {
+      update_('users', p.userId, { passwordHash: hashPassword_(String(p.newPassword), salt), passwordSalt: salt });
+      removeSessionsOf_(p.userId);
+    });
   },
   adminSetUserRole: function (me, p) {
     requireAdmin_(me);
     if (p.role !== 'admin' && p.role !== 'member') throw httpError_(400, 'Invalid role');
-    return withLock_(function () { return update_('users', p.userId, { role: p.role }); });
+    return withLock_(function () { return publicUser_(update_('users', p.userId, { role: p.role })); });
   },
   adminBanUser: function (me, p) {
     requireAdmin_(me);
     if (p.userId === me.id) throw httpError_(400, 'Tidak bisa menghapus akun sendiri');
-    return withLock_(function () { return update_('users', p.userId, { banned: true, role: 'member' }); });
+    withLock_(function () {
+      update_('users', p.userId, { banned: true, role: 'member' });
+      removeSessionsOf_(p.userId);
+    });
   },
   adminListProjects: function (me) {
     requireAdmin_(me);
@@ -406,43 +476,68 @@ function writeSheet_(sheet, header, rows) {
 // Auth & users
 // ---------------------------------------------------------------------------
 
-function verifyIdToken_(idToken) {
-  if (!idToken) throw httpError_(401, 'Unauthorized');
-  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, idToken);
-  var cacheKey = 'tok_' + Utilities.base64EncodeWebSafe(digest);
-  var cache = CacheService.getScriptCache();
-  var cached = cache.get(cacheKey);
-  if (cached) return JSON.parse(cached);
-
-  var resp = UrlFetchApp.fetch(
-    'https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=' + FIREBASE_API_KEY,
-    { method: 'post', contentType: 'application/json', payload: JSON.stringify({ idToken: idToken }), muteHttpExceptions: true }
-  );
-  if (resp.getResponseCode() !== 200) throw httpError_(401, 'Unauthorized');
-  var user = (JSON.parse(resp.getContentText()).users || [])[0];
-  if (!user) throw httpError_(401, 'Unauthorized');
-  var auth = { uid: user.localId, email: user.email || '' };
-  cache.put(cacheKey, JSON.stringify(auth), 600);
-  return auth;
+function normalizeEmail_(email) {
+  var e = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw httpError_(400, 'INVALID_EMAIL');
+  return e;
 }
 
-function ensureUser_(auth) {
-  var user = findById_('users', auth.uid);
-  if (user) return user;
-  return withLock_(function () {
-    var again = findById_('users', auth.uid);
-    if (again) return again;
-    var isFirst = readAll_('users').length === 0;
-    var isAdmin = isFirst || ADMIN_EMAILS.indexOf(auth.email) !== -1;
-    return insert_('users', {
-      id: auth.uid,
-      email: auth.email,
-      displayName: auth.email.split('@')[0],
-      role: isAdmin ? 'admin' : 'member',
-      banned: false,
-      createdAt: Date.now(),
-    });
+function findUserByEmail_(email) {
+  return readAll_('users').filter(function (u) { return u.email.toLowerCase() === email; })[0] || null;
+}
+
+/** Data user tanpa hash password. */
+function publicUser_(u) {
+  return { id: u.id, email: u.email, displayName: u.displayName, role: u.role, banned: u.banned, createdAt: u.createdAt };
+}
+
+function hashPassword_(password, salt) {
+  var key = Utilities.newBlob('site-survey:' + salt).getBytes();
+  var h = Utilities.computeHmacSha256Signature(Utilities.newBlob(password).getBytes(), key);
+  for (var i = 0; i < 300; i++) h = Utilities.computeHmacSha256Signature(h, key);
+  return Utilities.base64Encode(h);
+}
+
+function hashToken_(token) {
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token));
+  return Utilities.base64EncodeWebSafe(digest).replace(/=+$/, '');
+}
+
+function createSession_(userId) {
+  var token = Utilities.getUuid() + Utilities.getUuid();
+  var now = Date.now();
+  withLock_(function () {
+    insert_('sessions', { id: hashToken_(token), userId: userId, createdAt: now, expiresAt: now + SESSION_DAYS * 86400000 });
   });
+  return token;
+}
+
+function removeSessionsOf_(userId) {
+  var cache = CacheService.getScriptCache();
+  readAll_('sessions')
+    .filter(function (s) { return s.userId === userId; })
+    .forEach(function (s) {
+      cache.remove('sess_' + s.id);
+      remove_('sessions', s.id);
+    });
+}
+
+/** Cek token sesi dan kembalikan user yang login. */
+function authenticate_(token) {
+  if (!token) throw httpError_(401, 'UNAUTHORIZED');
+  var id = hashToken_(token);
+  var cache = CacheService.getScriptCache();
+  var userId = cache.get('sess_' + id);
+  if (!userId) {
+    var session = findById_('sessions', id);
+    if (!session || session.expiresAt < Date.now()) throw httpError_(401, 'UNAUTHORIZED');
+    userId = session.userId;
+    cache.put('sess_' + id, userId, 600);
+  }
+  var user = findById_('users', userId);
+  if (!user) throw httpError_(401, 'UNAUTHORIZED');
+  if (user.banned) throw httpError_(403, 'BANNED');
+  return publicUser_(user);
 }
 
 function requireAdmin_(me) {
@@ -520,6 +615,9 @@ function getSheet_(name) {
     sheet = ss.insertSheet(name);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
     sheet.setFrozenRows(1);
+  } else if (sheet.getLastColumn() < headers.length) {
+    // Kolom baru di versi terbaru — tambahkan header-nya.
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
   }
   return sheet;
 }

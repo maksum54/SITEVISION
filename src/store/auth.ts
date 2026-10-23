@@ -1,20 +1,12 @@
 import { create } from 'zustand'
-import {
-  createUserWithEmailAndPassword,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signOut,
-  type User,
-} from 'firebase/auth'
-import { auth } from '../lib/firebase'
-import { api, ApiError } from '../lib/api'
+import { api, ApiError, getToken, setAuthErrorHandler, setToken } from '../lib/api'
 import { clearQueryCache } from '../lib/query'
 import { flush } from '../lib/outbox'
 import type { UserProfile } from '../types'
 
+/** Akun & sesi login dikelola Google Apps Script (apps-script/Code.gs), tanpa Firebase. */
 interface AuthState {
-  user: User | null
-  profile: UserProfile | null
+  user: UserProfile | null
   initializing: boolean
   error: string | null
   login: (email: string, password: string) => Promise<void>
@@ -23,68 +15,81 @@ interface AuthState {
   loadProfile: () => Promise<void>
 }
 
-export const useAuth = create<AuthState>((set, get) => ({
-  user: null,
-  profile: null,
-  initializing: true,
-  error: null,
-  login: async (email, password) => {
-    set({ error: null })
-    try {
-      await signInWithEmailAndPassword(auth, email, password)
-    } catch (e) {
-      set({ error: (e as Error).message })
-      throw e
-    }
-  },
-  register: async (email, password) => {
-    set({ error: null })
-    try {
-      await createUserWithEmailAndPassword(auth, email, password)
-      // Profil user dibuat otomatis di sheet "users" saat request pertama ke Apps Script.
-      await get().loadProfile()
-    } catch (e) {
-      set({ error: (e as Error).message })
-      throw e
-    }
-  },
-  logout: async () => {
-    clearQueryCache()
-    set({ profile: null })
-    await signOut(auth)
-  },
-  loadProfile: async () => {
-    if (!auth.currentUser) return
-    try {
-      const profile = await api<UserProfile>('me')
-      set({ profile })
-      try {
-        localStorage.setItem('ss-profile', JSON.stringify(profile))
-      } catch {
-        /* ignore */
-      }
-    } catch (e) {
-      if (e instanceof ApiError && e.message === 'BANNED') {
-        sessionStorage.setItem('banned', '1')
-        await get().logout()
-      }
-    }
-  },
-}))
+const PROFILE_KEY = 'ss-profile'
 
-function cachedProfile(uid: string): UserProfile | null {
+function cachedProfile(): UserProfile | null {
   try {
-    const p = JSON.parse(localStorage.getItem('ss-profile') ?? 'null') as UserProfile | null
-    return p && p.id === uid ? p : null
+    return getToken() ? (JSON.parse(localStorage.getItem(PROFILE_KEY) ?? 'null') as UserProfile | null) : null
   } catch {
     return null
   }
 }
 
-onAuthStateChanged(auth, (user) => {
-  useAuth.setState({ user, initializing: false, profile: user ? cachedProfile(user.uid) : null })
-  if (user) {
-    void useAuth.getState().loadProfile()
-    void flush()
+function saveProfile(user: UserProfile | null) {
+  try {
+    if (user) localStorage.setItem(PROFILE_KEY, JSON.stringify(user))
+    else localStorage.removeItem(PROFILE_KEY)
+  } catch {
+    /* ignore */
+  }
+}
+
+function clearSession() {
+  setToken(null)
+  saveProfile(null)
+  clearQueryCache()
+  useAuth.setState({ user: null })
+}
+
+export const useAuth = create<AuthState>((set) => {
+  const signIn = async (action: 'login' | 'register', email: string, password: string) => {
+    set({ error: null })
+    try {
+      const res = await api<{ token: string; user: UserProfile }>(action, { email, password })
+      clearQueryCache()
+      setToken(res.token)
+      saveProfile(res.user)
+      set({ user: res.user })
+      void flush()
+    } catch (e) {
+      set({ error: e instanceof ApiError ? e.message : (e as Error).message })
+      throw e
+    }
+  }
+
+  return {
+    user: cachedProfile(),
+    initializing: false,
+    error: null,
+    login: (email, password) => signIn('login', email, password),
+    register: (email, password) => signIn('register', email, password),
+    logout: async () => {
+      try {
+        if (navigator.onLine) await api('logout')
+      } catch {
+        /* sesi mungkin sudah tidak berlaku */
+      }
+      clearSession()
+    },
+    loadProfile: async () => {
+      if (!getToken()) return
+      try {
+        const user = await api<UserProfile>('me')
+        saveProfile(user)
+        set({ user })
+      } catch {
+        /* offline: tetap pakai profil tersimpan; 401/BANNED ditangani di bawah */
+      }
+    },
   }
 })
+
+setAuthErrorHandler((e) => {
+  if (e.message === 'BANNED') sessionStorage.setItem('banned', '1')
+  clearSession()
+})
+
+if (getToken()) {
+  void useAuth.getState().loadProfile()
+  void flush()
+}

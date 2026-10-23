@@ -10,17 +10,17 @@ import type { Category, ExcelFile, Pin, Plan, Project, StorageStats, UserProfile
 
 export function useProjects() {
   const user = useAuth((s) => s.user)
-  const q = useQuery<Project[]>(user ? `projects:${user.uid}` : null, () => api('listProjects'))
+  const q = useQuery<Project[]>(user ? `projects:${user.id}` : null, () => api('listProjects'))
   return {
     projects: q.data ?? [],
     loading: q.loading,
     error: q.error,
     createProject: async (name: string) => {
       const project = await api<Project>('createProject', { name })
-      setQueryData<Project[]>(`projects:${user!.uid}`, (prev) => [project, ...(prev ?? [])])
+      setQueryData<Project[]>(`projects:${user!.id}`, (prev) => [project, ...(prev ?? [])])
     },
     deleteProject: async (projectId: string) => {
-      setQueryData<Project[]>(`projects:${user!.uid}`, (prev) => (prev ?? []).filter((p) => p.id !== projectId))
+      setQueryData<Project[]>(`projects:${user!.id}`, (prev) => (prev ?? []).filter((p) => p.id !== projectId))
       await api('deleteProject', { projectId })
     },
   }
@@ -112,8 +112,8 @@ export function usePins(projectId: string | undefined, planId: string | undefine
         notes: '',
         photoFileId: '',
         photoURL: '',
-        createdBy: user.uid,
-        createdByName: user.email ?? '',
+        createdBy: user.id,
+        createdByName: user.email,
         createdAt: now,
         updatedAt: now,
       }
@@ -177,6 +177,7 @@ export function useAdminUsers() {
       setQueryData<UserProfile[]>('admin:users', (prev) => (prev ?? []).map((u) => (u.id === userId ? { ...u, role } : u)))
       await api('adminSetUserRole', { userId, role })
     },
+    resetPassword: (userId: string, newPassword: string) => api('adminResetPassword', { userId, newPassword }),
     deleteUser: async (userId: string) => {
       setQueryData<UserProfile[]>('admin:users', (prev) => (prev ?? []).filter((u) => u.id !== userId))
       await api('adminBanUser', { userId })

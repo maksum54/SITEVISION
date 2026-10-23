@@ -3,7 +3,7 @@ import { useAuth } from '../../store/auth'
 import { useTranslation } from '../../i18n'
 
 export function RequireAdmin() {
-  const profile = useAuth((s) => s.profile)
+  const profile = useAuth((s) => s.user)
   const { t } = useTranslation()
   if (!profile) return <div className="p-6 text-sm text-slate-500">{t('app.loading')}</div>
   return profile.role === 'admin' ? <Outlet /> : <Navigate to="/" replace />

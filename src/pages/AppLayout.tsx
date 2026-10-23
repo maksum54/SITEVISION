@@ -6,7 +6,7 @@ import { LanguageToggle } from '../components/LanguageToggle'
 import { SyncBanner } from '../components/SyncBanner'
 
 function Shell() {
-  const { user, profile, logout, loadProfile } = useAuth()
+  const { user, logout, loadProfile } = useAuth()
   const { t } = useTranslation()
 
   // Cek berkala apakah user dinonaktifkan admin / role berubah.
@@ -26,7 +26,7 @@ function Shell() {
         </Link>
         <div className="flex items-center gap-3">
           <LanguageToggle />
-          {profile?.role === 'admin' && (
+          {user?.role === 'admin' && (
             <Link to="/admin" className="text-sm font-medium text-slate-700 underline">
               {t('app.admin')}
             </Link>
