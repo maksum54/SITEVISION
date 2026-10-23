@@ -4,7 +4,13 @@ import { usePlans } from '../hooks/data'
 import { useTranslation } from '../i18n'
 import { ExcelButton } from '../components/ExcelButton'
 
-function UploadPlan({ uploading, onUpload }: { uploading: boolean; onUpload: (name: string, file: File) => Promise<void> }) {
+function UploadPlan({
+  uploading,
+  onUpload,
+}: {
+  uploading: boolean
+  onUpload: (name: string, file: File) => Promise<void>
+}) {
   const { t } = useTranslation()
   const inputRef = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
@@ -102,7 +108,12 @@ export function PlansPage() {
               to={`/projects/${projectId}/plans/${p.id}`}
               className="block overflow-hidden rounded-lg border border-slate-200 active:opacity-80"
             >
-              <img src={p.imageURL} alt={p.name} className="aspect-square w-full object-cover" />
+              <img
+                src={p.imageURL}
+                referrerPolicy="no-referrer"
+                alt={p.name}
+                className="aspect-square w-full object-cover"
+              />
               <span className="block truncate p-2 text-sm font-medium text-slate-900">{p.name}</span>
             </Link>
             <button

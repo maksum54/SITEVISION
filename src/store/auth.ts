@@ -2,15 +2,16 @@ import { create } from 'zustand'
 import { api, ApiError, getToken, setAuthErrorHandler, setToken } from '../lib/api'
 import { clearQueryCache } from '../lib/query'
 import { flush } from '../lib/outbox'
+import { disableGoogleAutoSelect } from '../lib/googleSignIn'
 import type { UserProfile } from '../types'
 
-/** Akun & sesi login dikelola Google Apps Script (apps-script/Code.gs), tanpa Firebase. */
+/** Login dengan akun Google; sesi dikelola Google Apps Script (apps-script/Code.gs). */
 interface AuthState {
   user: UserProfile | null
   initializing: boolean
   error: string | null
-  login: (email: string, password: string) => Promise<void>
-  register: (email: string, password: string) => Promise<void>
+  loginWithGoogle: (credential: string) => Promise<void>
+  setError: (error: string | null) => void
   logout: () => Promise<void>
   loadProfile: () => Promise<void>
 }
@@ -42,10 +43,10 @@ function clearSession() {
 }
 
 export const useAuth = create<AuthState>((set) => {
-  const signIn = async (action: 'login' | 'register', email: string, password: string) => {
+  const loginWithGoogle = async (credential: string) => {
     set({ error: null })
     try {
-      const res = await api<{ token: string; user: UserProfile }>(action, { email, password })
+      const res = await api<{ token: string; user: UserProfile }>('loginGoogle', { credential })
       clearQueryCache()
       setToken(res.token)
       saveProfile(res.user)
@@ -61,14 +62,15 @@ export const useAuth = create<AuthState>((set) => {
     user: cachedProfile(),
     initializing: false,
     error: null,
-    login: (email, password) => signIn('login', email, password),
-    register: (email, password) => signIn('register', email, password),
+    loginWithGoogle,
+    setError: (error) => set({ error }),
     logout: async () => {
       try {
         if (navigator.onLine) await api('logout')
       } catch {
         /* sesi mungkin sudah tidak berlaku */
       }
+      disableGoogleAutoSelect()
       clearSession()
     },
     loadProfile: async () => {

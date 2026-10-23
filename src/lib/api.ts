@@ -49,7 +49,7 @@ interface ApiResponse<T> {
 export async function api<T = unknown>(action: string, payload: Record<string, unknown> = {}): Promise<T> {
   if (!API_URL) throw new ApiError('VITE_APPS_SCRIPT_URL belum diatur. Lihat README.md.', 500)
   const token = getToken()
-  const isPublic = action === 'login' || action === 'register'
+  const isPublic = action === 'loginGoogle'
   if (!token && !isPublic) throw new ApiError('UNAUTHORIZED', 401)
 
   let res: Response

@@ -7,24 +7,32 @@
  *   - Gambar denah & foto temuan disimpan di Google Drive.
  *   - Export laporan ke file Excel (.xlsx).
  *
- * Login juga ditangani di sini (tanpa Firebase): akun disimpan di sheet "users"
- * dengan password ter-hash (salt + SHA-256 berulang), dan setiap login
- * menghasilkan token sesi yang disimpan (dalam bentuk hash) di sheet "sessions".
+ * Login memakai akun Google ("Masuk dengan Google"): aplikasi mengirim ID token
+ * Google, script ini memverifikasinya ke server Google, lalu membuat token sesi
+ * yang disimpan (dalam bentuk hash) di sheet "sessions". Tidak ada password.
  *
  * Cara pasang: lihat README.md bagian "Setup Google Apps Script".
  */
 
 // ====== KONFIGURASI ======
+// OAuth Client ID (Web application) dari Google Cloud Console.
+// Harus sama dengan VITE_GOOGLE_CLIENT_ID di aplikasi. Bisa juga diisi lewat
+// Project Settings → Script properties dengan nama GOOGLE_CLIENT_ID.
+var GOOGLE_CLIENT_ID = '';
 // Lama sesi login (hari).
 var SESSION_DAYS = 30;
 // Nama folder root di Google Drive untuk menyimpan foto & denah.
 var DRIVE_ROOT_FOLDER_NAME = 'Site Survey';
-// Email yang otomatis jadi admin (opsional). User pertama yang mendaftar juga otomatis admin.
+// Email yang otomatis jadi admin (opsional). User pertama yang login juga otomatis admin.
 var ADMIN_EMAILS = [];
+// Batasi siapa yang boleh masuk (opsional). Kosong = semua akun Google boleh.
+// Contoh: ALLOWED_DOMAINS = ['perusahaan.co.id']; ALLOWED_EMAILS = ['budi@gmail.com'];
+var ALLOWED_DOMAINS = [];
+var ALLOWED_EMAILS = [];
 // ==========================
 
 var SCHEMA = {
-  users: ['id', 'email', 'displayName', 'role', 'banned', 'createdAt', 'passwordHash', 'passwordSalt'],
+  users: ['id', 'email', 'displayName', 'role', 'banned', 'createdAt', 'googleSub', 'picture'],
   sessions: ['id', 'userId', 'createdAt', 'expiresAt'],
   projects: ['id', 'name', 'createdBy', 'memberUids', 'createdAt'],
   plans: ['id', 'projectId', 'name', 'imageFileId', 'imageURL', 'imageWidth', 'imageHeight', 'createdBy', 'createdAt'],
@@ -87,40 +95,32 @@ function setup() {
 
 // Action tanpa login
 var PUBLIC_ACTIONS = {
-  register: function (p) {
-    var email = normalizeEmail_(p.email);
-    var password = String(p.password || '');
-    if (password.length < 6) throw httpError_(400, 'WEAK_PASSWORD');
+  loginGoogle: function (p) {
+    var g = verifyGoogleIdToken_(p.credential);
+    var email = g.email.toLowerCase();
+    if (!isEmailAllowed_(email)) throw httpError_(403, 'NOT_ALLOWED');
     var user = withLock_(function () {
-      if (findUserByEmail_(email)) throw httpError_(409, 'EMAIL_IN_USE');
+      var existing = findUserByEmail_(email);
+      if (existing) {
+        if (existing.banned) throw httpError_(403, 'BANNED');
+        return update_('users', existing.id, {
+          googleSub: g.sub,
+          picture: g.picture || '',
+          displayName: g.name || existing.displayName,
+        });
+      }
       var isFirst = readAll_('users').length === 0;
-      var salt = newId_();
       return insert_('users', {
         id: newId_(),
         email: email,
-        displayName: email.split('@')[0],
+        displayName: g.name || email.split('@')[0],
         role: isFirst || ADMIN_EMAILS.indexOf(email) !== -1 ? 'admin' : 'member',
         banned: false,
         createdAt: Date.now(),
-        passwordHash: hashPassword_(password, salt),
-        passwordSalt: salt,
+        googleSub: g.sub,
+        picture: g.picture || '',
       });
     });
-    return { token: createSession_(user.id), user: publicUser_(user) };
-  },
-  login: function (p) {
-    var email = normalizeEmail_(p.email);
-    var cache = CacheService.getScriptCache();
-    var attemptsKey = 'login_fail_' + Utilities.base64EncodeWebSafe(email);
-    var attempts = Number(cache.get(attemptsKey) || 0);
-    if (attempts >= 10) throw httpError_(429, 'TOO_MANY_ATTEMPTS');
-    var user = findUserByEmail_(email);
-    if (!user || !user.passwordHash || hashPassword_(String(p.password || ''), user.passwordSalt) !== user.passwordHash) {
-      cache.put(attemptsKey, String(attempts + 1), 600);
-      throw httpError_(401, 'INVALID_CREDENTIALS');
-    }
-    if (user.banned) throw httpError_(403, 'BANNED');
-    cache.remove(attemptsKey);
     return { token: createSession_(user.id), user: publicUser_(user) };
   },
 };
@@ -133,17 +133,6 @@ var ACTIONS = {
     var id = hashToken_(token);
     CacheService.getScriptCache().remove('sess_' + id);
     withLock_(function () { remove_('sessions', id); });
-  },
-  changePassword: function (me, p) {
-    var user = findById_('users', me.id);
-    if (hashPassword_(String(p.oldPassword || ''), user.passwordSalt) !== user.passwordHash) {
-      throw httpError_(401, 'INVALID_CREDENTIALS');
-    }
-    if (String(p.newPassword || '').length < 6) throw httpError_(400, 'WEAK_PASSWORD');
-    var salt = newId_();
-    withLock_(function () {
-      update_('users', me.id, { passwordHash: hashPassword_(String(p.newPassword), salt), passwordSalt: salt });
-    });
   },
 
   // ----- Projects -----
@@ -301,15 +290,6 @@ var ACTIONS = {
   adminListUsers: function (me) {
     requireAdmin_(me);
     return readAll_('users').filter(function (u) { return !u.banned; }).map(publicUser_).sort(byDesc_('createdAt'));
-  },
-  adminResetPassword: function (me, p) {
-    requireAdmin_(me);
-    if (String(p.newPassword || '').length < 6) throw httpError_(400, 'WEAK_PASSWORD');
-    var salt = newId_();
-    withLock_(function () {
-      update_('users', p.userId, { passwordHash: hashPassword_(String(p.newPassword), salt), passwordSalt: salt });
-      removeSessionsOf_(p.userId);
-    });
   },
   adminSetUserRole: function (me, p) {
     requireAdmin_(me);
@@ -476,26 +456,47 @@ function writeSheet_(sheet, header, rows) {
 // Auth & users
 // ---------------------------------------------------------------------------
 
-function normalizeEmail_(email) {
-  var e = String(email || '').trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw httpError_(400, 'INVALID_EMAIL');
-  return e;
+function googleClientId_() {
+  return GOOGLE_CLIENT_ID || PropertiesService.getScriptProperties().getProperty('GOOGLE_CLIENT_ID') || '';
+}
+
+/** Verifikasi ID token Google (dari tombol "Masuk dengan Google") ke server Google. */
+function verifyGoogleIdToken_(credential) {
+  var clientId = googleClientId_();
+  if (!clientId) throw httpError_(500, 'GOOGLE_CLIENT_ID belum diisi di Code.gs');
+  if (!credential) throw httpError_(400, 'INVALID_TOKEN');
+  var resp = UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential),
+    { muteHttpExceptions: true }
+  );
+  if (resp.getResponseCode() !== 200) throw httpError_(401, 'INVALID_TOKEN');
+  var info = JSON.parse(resp.getContentText());
+  var validIssuer = info.iss === 'accounts.google.com' || info.iss === 'https://accounts.google.com';
+  var verified = info.email_verified === true || info.email_verified === 'true';
+  if (info.aud !== clientId || !validIssuer || !verified || !info.email || Number(info.exp) * 1000 < Date.now()) {
+    throw httpError_(401, 'INVALID_TOKEN');
+  }
+  return { sub: String(info.sub), email: String(info.email), name: info.name || '', picture: info.picture || '' };
+}
+
+function isEmailAllowed_(email) {
+  if (!ALLOWED_DOMAINS.length && !ALLOWED_EMAILS.length) return true;
+  if (ALLOWED_EMAILS.map(function (e) { return e.toLowerCase(); }).indexOf(email) !== -1) return true;
+  if (ADMIN_EMAILS.map(function (e) { return e.toLowerCase(); }).indexOf(email) !== -1) return true;
+  var domain = email.split('@')[1];
+  return ALLOWED_DOMAINS.map(function (d) { return d.toLowerCase(); }).indexOf(domain) !== -1;
 }
 
 function findUserByEmail_(email) {
   return readAll_('users').filter(function (u) { return u.email.toLowerCase() === email; })[0] || null;
 }
 
-/** Data user tanpa hash password. */
+/** Data user yang aman dikirim ke aplikasi. */
 function publicUser_(u) {
-  return { id: u.id, email: u.email, displayName: u.displayName, role: u.role, banned: u.banned, createdAt: u.createdAt };
-}
-
-function hashPassword_(password, salt) {
-  var key = Utilities.newBlob('site-survey:' + salt).getBytes();
-  var h = Utilities.computeHmacSha256Signature(Utilities.newBlob(password).getBytes(), key);
-  for (var i = 0; i < 300; i++) h = Utilities.computeHmacSha256Signature(h, key);
-  return Utilities.base64Encode(h);
+  return {
+    id: u.id, email: u.email, displayName: u.displayName, picture: u.picture || '',
+    role: u.role, banned: u.banned, createdAt: u.createdAt,
+  };
 }
 
 function hashToken_(token) {
@@ -607,6 +608,8 @@ function countFolder_(folder, stats) {
 // Google Sheets "database"
 // ---------------------------------------------------------------------------
 
+var HEADERS_CHECKED = {};
+
 function getSheet_(name) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = ss.getSheetByName(name);
@@ -615,10 +618,19 @@ function getSheet_(name) {
     sheet = ss.insertSheet(name);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
     sheet.setFrozenRows(1);
-  } else if (sheet.getLastColumn() < headers.length) {
-    // Kolom baru di versi terbaru — tambahkan header-nya.
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+  } else if (!HEADERS_CHECKED[name]) {
+    // Sesuaikan header dengan versi terbaru; kosongkan kolom yang isinya berubah arti.
+    var width = Math.max(sheet.getLastColumn(), headers.length);
+    var current = sheet.getRange(1, 1, 1, width).getValues()[0];
+    var last = sheet.getLastRow();
+    for (var c = 0; c < width; c++) {
+      var want = c < headers.length ? headers[c] : '';
+      if (String(current[c]) === want) continue;
+      if (last > 1 && current[c] !== '') sheet.getRange(2, c + 1, last - 1, 1).clearContent();
+      sheet.getRange(1, c + 1).setValue(want).setFontWeight('bold');
+    }
   }
+  HEADERS_CHECKED[name] = true;
   return sheet;
 }
 

@@ -106,7 +106,12 @@ export function PinForm({
             <label className="mb-1 block text-sm font-medium text-slate-700">{t('pinForm.photo')}</label>
             {photo && (
               <button type="button" onClick={() => setViewerOpen(true)} className="mb-2 block w-full">
-                <img src={photo} alt={t('pinForm.photoAlt')} className="h-40 w-full rounded-lg object-cover" />
+                <img
+                  src={photo}
+                  referrerPolicy="no-referrer"
+                  alt={t('pinForm.photoAlt')}
+                  className="h-40 w-full rounded-lg object-cover"
+                />
               </button>
             )}
             {pin.localPhotoPending && <p className="mb-2 text-xs text-amber-600">{t('pinForm.photoPending')}</p>}
@@ -132,6 +137,7 @@ export function PinForm({
           </button>
           <img
             src={photo}
+            referrerPolicy="no-referrer"
             alt={t('pinForm.photoAlt')}
             className="max-h-full max-w-full object-contain"
             onClick={(e) => e.stopPropagation()}

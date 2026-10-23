@@ -78,7 +78,12 @@ export function PunchListPage() {
               className="flex min-w-0 flex-1 items-center gap-3 text-left"
             >
               {pin.photoURL ? (
-                <img src={pin.photoURL} alt="" className="h-14 w-14 shrink-0 rounded-md object-cover" />
+                <img
+                  src={pin.photoURL}
+                  referrerPolicy="no-referrer"
+                  alt=""
+                  className="h-14 w-14 shrink-0 rounded-md object-cover"
+                />
               ) : (
                 <div
                   className="flex h-14 w-14 shrink-0 items-center justify-center rounded-md text-white"

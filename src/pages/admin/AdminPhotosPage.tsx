@@ -13,7 +13,12 @@ export function AdminPhotosPage() {
         {pins.map((pin) => (
           <div key={pin.id} className="overflow-hidden rounded-lg border border-slate-200">
             <a href={`https://drive.google.com/file/d/${pin.photoFileId}/view`} target="_blank" rel="noreferrer">
-              <img src={pin.photoURL} alt={pin.category} className="aspect-square w-full object-cover" />
+              <img
+                src={pin.photoURL}
+                referrerPolicy="no-referrer"
+                alt={pin.category}
+                className="aspect-square w-full object-cover"
+              />
             </a>
             <div className="p-2">
               <p className="truncate text-xs font-semibold text-slate-900">{pin.category}</p>

@@ -5,6 +5,7 @@ export interface UserProfile {
   id: string
   email: string
   displayName: string
+  picture: string
   role: Role
   banned: boolean
   createdAt: number

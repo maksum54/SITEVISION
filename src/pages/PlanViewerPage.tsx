@@ -80,7 +80,13 @@ export function PlanViewerPage() {
         >
           <TransformComponent wrapperStyle={{ width: '100%', height: '100%' }} contentStyle={{ width: '100%' }}>
             <div ref={contentRef} onClick={onPlanClick} className="relative w-full">
-              <img src={plan.imageURL} alt={plan.name} draggable={false} className="block w-full select-none" />
+              <img
+                src={plan.imageURL}
+                referrerPolicy="no-referrer"
+                alt={plan.name}
+                draggable={false}
+                className="block w-full select-none"
+              />
               {pins.map((pin) => (
                 <PinMarker
                   key={pin.id}

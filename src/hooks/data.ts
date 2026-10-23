@@ -177,7 +177,6 @@ export function useAdminUsers() {
       setQueryData<UserProfile[]>('admin:users', (prev) => (prev ?? []).map((u) => (u.id === userId ? { ...u, role } : u)))
       await api('adminSetUserRole', { userId, role })
     },
-    resetPassword: (userId: string, newPassword: string) => api('adminResetPassword', { userId, newPassword }),
     deleteUser: async (userId: string) => {
       setQueryData<UserProfile[]>('admin:users', (prev) => (prev ?? []).filter((u) => u.id !== userId))
       await api('adminBanUser', { userId })
