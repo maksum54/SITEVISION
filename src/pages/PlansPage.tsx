@@ -4,13 +4,7 @@ import { usePlans } from '../hooks/data'
 import { useTranslation } from '../i18n'
 import { ExcelButton } from '../components/ExcelButton'
 
-function UploadPlan({
-  uploading,
-  onUpload,
-}: {
-  uploading: boolean
-  onUpload: (name: string, file: File) => Promise<void>
-}) {
+function UploadPlan({ onUpload }: { onUpload: (name: string, file: File) => Promise<void> }) {
   const { t } = useTranslation()
   const inputRef = useRef<HTMLInputElement>(null)
   const [file, setFile] = useState<File | null>(null)
@@ -28,21 +22,17 @@ function UploadPlan({
         />
         <button
           type="button"
-          disabled={uploading}
-          onClick={async () => {
+          onClick={() => {
             if (!name.trim()) return
-            try {
-              await onUpload(name.trim(), file)
-              setFile(null)
-              setName('')
-              if (inputRef.current) inputRef.current.value = ''
-            } catch (e) {
-              window.alert(t('error.generic', { error: (e as Error).message }))
-            }
+            // Denah langsung muncul di daftar; unggahan berjalan di belakang.
+            onUpload(name.trim(), file).catch((e: Error) => window.alert(t('error.generic', { error: e.message })))
+            setFile(null)
+            setName('')
+            if (inputRef.current) inputRef.current.value = ''
           }}
-          className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+          className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white"
         >
-          {t(uploading ? 'plans.uploading' : 'plans.uploadConfirm')}
+          {t('plans.uploadConfirm')}
         </button>
       </div>
     )
@@ -75,7 +65,7 @@ function UploadPlan({
 
 export function PlansPage() {
   const { projectId } = useParams()
-  const { plans, loading, error, uploading, uploadPlan, deletePlan } = usePlans(projectId)
+  const { plans, loading, error, uploadPlan, deletePlan } = usePlans(projectId)
   const { t } = useTranslation()
 
   const onDelete = async (id: string, name: string) => {
@@ -93,7 +83,7 @@ export function PlansPage() {
         <h1 className="text-xl font-bold text-slate-900">{t('plans.title')}</h1>
         <div className="flex flex-wrap items-center gap-2">
           {plans.length > 0 && <ExcelButton projectId={projectId} />}
-          <UploadPlan uploading={uploading} onUpload={uploadPlan} />
+          <UploadPlan onUpload={uploadPlan} />
         </div>
       </div>
       {loading && <p className="text-sm text-slate-500">{t('app.loading')}</p>}
@@ -104,26 +94,42 @@ export function PlansPage() {
       <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3">
         {plans.map((p) => (
           <li key={p.id} className="relative">
-            <Link
-              to={`/projects/${projectId}/plans/${p.id}`}
-              className="block overflow-hidden rounded-lg border border-slate-200 active:opacity-80"
-            >
-              <img
-                src={p.imageURL}
-                referrerPolicy="no-referrer"
-                alt={p.name}
-                className="aspect-square w-full object-cover"
-              />
-              <span className="block truncate p-2 text-sm font-medium text-slate-900">{p.name}</span>
-            </Link>
-            <button
-              type="button"
-              onClick={() => onDelete(p.id, p.name)}
-              aria-label={t('plans.delete')}
-              className="absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-full bg-red-600/80 text-sm text-white backdrop-blur-sm"
-            >
-              🗑
-            </button>
+            {p.localPending ? (
+              <div className="block overflow-hidden rounded-lg border border-slate-200">
+                <div className="relative aspect-square w-full bg-slate-100">
+                  {p.imageURL && (
+                    <img src={p.imageURL} alt={p.name} className="h-full w-full object-cover opacity-60" />
+                  )}
+                  <span className="absolute inset-0 flex items-center justify-center text-sm font-medium text-slate-700">
+                    {t('plans.uploading')}
+                  </span>
+                </div>
+                <span className="block truncate p-2 text-sm font-medium text-slate-500">{p.name}</span>
+              </div>
+            ) : (
+              <Link
+                to={`/projects/${projectId}/plans/${p.id}`}
+                className="block overflow-hidden rounded-lg border border-slate-200 active:opacity-80"
+              >
+                <img
+                  src={p.imageURL}
+                  referrerPolicy="no-referrer"
+                  alt={p.name}
+                  className="aspect-square w-full object-cover"
+                />
+                <span className="block truncate p-2 text-sm font-medium text-slate-900">{p.name}</span>
+              </Link>
+            )}
+            {!p.localPending && (
+              <button
+                type="button"
+                onClick={() => onDelete(p.id, p.name)}
+                aria-label={t('plans.delete')}
+                className="absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-full bg-red-600/80 text-sm text-white backdrop-blur-sm"
+              >
+                🗑
+              </button>
+            )}
           </li>
         ))}
       </ul>

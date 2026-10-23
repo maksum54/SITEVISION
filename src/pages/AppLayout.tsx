@@ -4,10 +4,13 @@ import { useAuth } from '../store/auth'
 import { useTranslation } from '../i18n'
 import { LanguageToggle } from '../components/LanguageToggle'
 import { SyncBanner } from '../components/SyncBanner'
+import { useCategories } from '../hooks/data'
 
 function Shell() {
   const { user, logout, loadProfile } = useAuth()
   const { t } = useTranslation()
+  // Ambil kategori sejak awal; request ini digabung dengan data user & proyek dalam satu batch.
+  useCategories()
 
   // Cek berkala apakah user dinonaktifkan admin / role berubah.
   useEffect(() => {

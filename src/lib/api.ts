@@ -1,4 +1,3 @@
-
 const API_URL = import.meta.env.VITE_APPS_SCRIPT_URL as string | undefined
 const TOKEN_KEY = 'ss-token'
 
@@ -45,11 +44,15 @@ interface ApiResponse<T> {
   error?: string
 }
 
-/** Panggil action di Google Apps Script (apps-script/Code.gs). */
-export async function api<T = unknown>(action: string, payload: Record<string, unknown> = {}): Promise<T> {
+const PUBLIC_ACTIONS = new Set(['loginGoogle'])
+// Request besar / khusus dikirim sendiri, tidak digabung.
+const UNBATCHED = new Set(['loginGoogle', 'logout', 'uploadPlan', 'uploadPinPhoto', 'exportExcel'])
+const BATCH_WINDOW_MS = 15
+const BATCH_MAX = 20
+
+async function post<T>(body: Record<string, unknown>, isPublic: boolean): Promise<T> {
   if (!API_URL) throw new ApiError('VITE_APPS_SCRIPT_URL belum diatur. Lihat README.md.', 500)
   const token = getToken()
-  const isPublic = action === 'loginGoogle'
   if (!token && !isPublic) throw new ApiError('UNAUTHORIZED', 401)
 
   let res: Response
@@ -58,25 +61,83 @@ export async function api<T = unknown>(action: string, payload: Record<string, u
     res = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action, token, payload }),
+      body: JSON.stringify({ ...body, token }),
     })
   } catch (e) {
     throw new NetworkError(e instanceof Error ? e.message : String(e))
   }
   if (!res.ok) throw new NetworkError(`HTTP ${res.status}`)
 
-  let body: ApiResponse<T>
+  let parsed: ApiResponse<T>
   try {
-    body = await res.json()
+    parsed = await res.json()
   } catch {
     throw new ApiError('Respons server tidak valid. Pastikan Web App Apps Script di-deploy dengan akses "Anyone".', 500)
   }
-  if (!body.ok) {
-    const err = new ApiError(body.error ?? 'Server error', body.status ?? 500)
+  return unwrap(parsed, isPublic)
+}
+
+function unwrap<T>(res: ApiResponse<T>, isPublic: boolean): T {
+  if (!res.ok) {
+    const err = new ApiError(res.error ?? 'Server error', res.status ?? 500)
     if (!isPublic && (err.status === 401 || err.message === 'BANNED')) onAuthError?.(err)
     throw err
   }
-  return body.data as T
+  return res.data as T
+}
+
+interface Queued {
+  action: string
+  payload: Record<string, unknown>
+  resolve: (v: unknown) => void
+  reject: (e: unknown) => void
+}
+
+let queue: Queued[] = []
+let timer: ReturnType<typeof setTimeout> | undefined
+
+/**
+ * Request yang terjadi hampir bersamaan (mis. saat membuka halaman) digabung
+ * menjadi satu request "batch", supaya hanya sekali bolak-balik ke Apps Script.
+ */
+async function flushQueue() {
+  timer = undefined
+  const calls = queue.splice(0, BATCH_MAX)
+  if (queue.length) timer = setTimeout(flushQueue, 0)
+  if (calls.length === 1) {
+    const c = calls[0]
+    post({ action: c.action, payload: c.payload }, false).then(c.resolve, c.reject)
+    return
+  }
+  try {
+    const results = await post<ApiResponse<unknown>[]>(
+      { action: 'batch', calls: calls.map((c) => ({ action: c.action, payload: c.payload })) },
+      false,
+    )
+    calls.forEach((c, i) => {
+      try {
+        c.resolve(unwrap(results[i] ?? { ok: false, error: 'Missing batch result' }, false))
+      } catch (e) {
+        c.reject(e)
+      }
+    })
+  } catch (e) {
+    calls.forEach((c) => c.reject(e))
+  }
+}
+
+/** Panggil action di Google Apps Script (apps-script/Code.gs). */
+export function api<T = unknown>(action: string, payload: Record<string, unknown> = {}): Promise<T> {
+  if (UNBATCHED.has(action)) return post<T>({ action, payload }, PUBLIC_ACTIONS.has(action))
+  return new Promise<T>((resolve, reject) => {
+    queue.push({ action, payload, resolve: resolve as (v: unknown) => void, reject })
+    timer ??= setTimeout(flushQueue, BATCH_WINDOW_MS)
+  })
+}
+
+/** ID buatan aplikasi, supaya data baru bisa langsung tampil sebelum tersimpan di server. */
+export function newId() {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 20)
 }
 
 export function blobToBase64(blob: Blob): Promise<string> {

@@ -14,7 +14,17 @@ Aplikasi PWA untuk survei lokasi konstruksi: buat proyek, unggah denah (gambar/P
 
 Firebase (Auth & Firestore) dan Cloudinary **tidak dipakai lagi**.
 
-Setiap perubahan temuan (pin) dan foto langsung tampil di layar, lalu dikirim ke Apps Script di latar belakang. Saat offline, perubahan disimpan di perangkat (IndexedDB) dan dikirim otomatis begitu online lagi.
+### Supaya tetap cepat
+
+Google Sheets + Apps Script lebih lambat dari database biasa (sekitar 1–3 detik per request), jadi aplikasi ini dibuat supaya user jarang menunggu:
+
+- **Langsung tampil:** proyek, denah, temuan (pin), status, catatan, dan foto langsung muncul di layar, lalu disimpan ke server di latar belakang.
+- **Request digabung:** request yang terjadi bersamaan (misalnya data user, proyek, dan kategori saat aplikasi dibuka) dikirim sebagai satu request `batch`.
+- **Cache di server:** `Code.gs` menyimpan isi sheet di CacheService. Request baca tidak perlu membuka spreadsheet, dan cache otomatis diperbarui setiap ada perubahan.
+- **Cache di HP:** data terakhir disimpan di perangkat, jadi halaman yang pernah dibuka langsung muncul, lalu diperbarui di belakang.
+- **Offline:** perubahan temuan dan foto disimpan di perangkat (IndexedDB) dan dikirim otomatis begitu online lagi.
+
+> Kalau data diedit langsung di Google Sheets, aplikasi bisa butuh waktu sampai 6 jam untuk melihatnya (karena cache). Jalankan fungsi `clearCache` dari editor Apps Script supaya langsung terbaca.
 
 ## 1. Buat OAuth Client ID (untuk "Masuk dengan Google")
 

@@ -8,7 +8,6 @@ export function ProjectsPage() {
   const { t } = useTranslation()
   const [showForm, setShowForm] = useState(false)
   const [name, setName] = useState('')
-  const [saving, setSaving] = useState(false)
 
   const onDelete = async (id: string, projectName: string) => {
     if (!window.confirm(t('projects.deleteConfirm', { name: projectName }))) return
@@ -42,21 +41,14 @@ export function ProjectsPage() {
           />
           <button
             type="button"
-            disabled={saving}
-            onClick={async () => {
+            onClick={() => {
               if (!name.trim()) return
-              setSaving(true)
-              try {
-                await createProject(name.trim())
-                setName('')
-                setShowForm(false)
-              } catch (e) {
-                window.alert(t('error.generic', { error: (e as Error).message }))
-              } finally {
-                setSaving(false)
-              }
+              // Proyek langsung muncul di daftar; penyimpanan berjalan di belakang.
+              createProject(name.trim()).catch((e: Error) => window.alert(t('error.generic', { error: e.message })))
+              setName('')
+              setShowForm(false)
             }}
-            className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
+            className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white"
           >
             {t('projects.save')}
           </button>
@@ -70,17 +62,26 @@ export function ProjectsPage() {
       <ul className="space-y-2">
         {projects.map((p) => (
           <li key={p.id} className="flex items-center gap-2 rounded-lg border border-slate-200">
-            <Link to={`/projects/${p.id}`} className="flex-1 p-4 active:bg-slate-50">
-              <span className="font-semibold text-slate-900">{p.name}</span>
-            </Link>
-            <button
-              type="button"
-              onClick={() => onDelete(p.id, p.name)}
-              aria-label={t('projects.delete')}
-              className="mr-3 shrink-0 rounded-lg border border-red-300 px-2 py-1.5 text-xs font-medium text-red-600"
-            >
-              🗑
-            </button>
+            {p.localPending ? (
+              <div className="flex flex-1 items-center justify-between p-4">
+                <span className="font-semibold text-slate-500">{p.name}</span>
+                <span className="text-xs text-slate-400">{t('pinForm.saving')}</span>
+              </div>
+            ) : (
+              <Link to={`/projects/${p.id}`} className="flex-1 p-4 active:bg-slate-50">
+                <span className="font-semibold text-slate-900">{p.name}</span>
+              </Link>
+            )}
+            {!p.localPending && (
+              <button
+                type="button"
+                onClick={() => onDelete(p.id, p.name)}
+                aria-label={t('projects.delete')}
+                className="mr-3 shrink-0 rounded-lg border border-red-300 px-2 py-1.5 text-xs font-medium text-red-600"
+              >
+                🗑
+              </button>
+            )}
           </li>
         ))}
       </ul>

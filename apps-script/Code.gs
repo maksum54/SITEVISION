@@ -15,7 +15,7 @@
  */
 
 // Versi kode — buka URL Web App (/exec) di browser untuk mengecek versi yang sedang aktif.
-var CODE_VERSION = '3-google-login';
+var CODE_VERSION = '4-fast';
 
 // ====== KONFIGURASI ======
 // OAuth Client ID (Web application) dari Google Cloud Console.
@@ -72,6 +72,7 @@ function doPost(e) {
     var body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
     var publicHandler = PUBLIC_ACTIONS[body.action];
     if (publicHandler) return json_({ ok: true, data: publicHandler(body.payload || {}) });
+    if (body.action === 'batch') return json_({ ok: true, data: runBatch_(body) });
     var handler = ACTIONS[body.action];
     if (!handler) throw httpError_(400, 'Unknown action: ' + body.action);
     var me = authenticate_(body.token);
@@ -80,6 +81,30 @@ function doPost(e) {
   } catch (err) {
     return json_({ ok: false, status: err.status || 500, error: String(err.message || err) });
   }
+}
+
+/**
+ * Beberapa action sekaligus dalam satu request (aplikasi menggabungkan request
+ * yang terjadi bersamaan), supaya tidak perlu bolak-balik ke server berkali-kali.
+ */
+function runBatch_(body) {
+  var me = authenticate_(body.token);
+  return (body.calls || []).slice(0, 20).map(function (call) {
+    try {
+      var handler = ACTIONS[call.action];
+      if (!handler || call.action === 'logout') throw httpError_(400, 'Unknown action: ' + call.action);
+      var data = handler(me, call.payload || {}, body.token);
+      return { ok: true, data: data === undefined ? null : data };
+    } catch (err) {
+      return { ok: false, status: err.status || 500, error: String(err.message || err) };
+    }
+  });
+}
+
+/** Jalankan dari editor Apps Script setelah mengedit data langsung di spreadsheet. */
+function clearCache() {
+  Object.keys(SCHEMA).forEach(invalidate_);
+  Logger.log('Cache dikosongkan.');
 }
 
 /** Jalankan sekali dari editor Apps Script untuk membuat sheet & folder serta memberi izin. */
@@ -146,9 +171,15 @@ var ACTIONS = {
   },
   createProject: function (me, p) {
     var name = requireText_(p.name, 'name');
+    var id = clientId_(p.id);
     return withLock_(function () {
+      var existing = findById_('projects', id);
+      if (existing) {
+        if (existing.createdBy !== me.id) throw httpError_(409, 'Conflict');
+        return existing; // idempotent saat dikirim ulang
+      }
       return insert_('projects', {
-        id: newId_(), name: name, createdBy: me.id, memberUids: [me.id], createdAt: Date.now(),
+        id: id, name: name, createdBy: me.id, memberUids: [me.id], createdAt: Date.now(),
       });
     });
   },
@@ -174,7 +205,8 @@ var ACTIONS = {
   uploadPlan: function (me, p) {
     requireProjectAccess_(me, p.projectId);
     var name = requireText_(p.name, 'name');
-    var id = newId_();
+    var id = clientId_(p.id);
+    if (findById_('plans', id)) throw httpError_(409, 'Conflict');
     var file = saveImage_('plans', 'plan-' + id + '-' + (p.fileName || 'plan'), p.mimeType, p.base64);
     return withLock_(function () {
       return insert_('plans', {
@@ -204,7 +236,7 @@ var ACTIONS = {
   },
   createPin: function (me, p) {
     requireProjectAccess_(me, p.projectId);
-    var id = String(p.id || newId_());
+    var id = clientId_(p.id);
     return withLock_(function () {
       var existing = findById_('pins', id);
       if (existing) return existing; // idempotent saat sinkronisasi ulang
@@ -631,13 +663,85 @@ function getSheet_(name) {
       if (String(current[c]) === want) continue;
       if (last > 1 && current[c] !== '') sheet.getRange(2, c + 1, last - 1, 1).clearContent();
       sheet.getRange(1, c + 1).setValue(want).setFontWeight('bold');
+      HEADERS_CHECKED[name] = true;
+      invalidate_(name);
     }
   }
   HEADERS_CHECKED[name] = true;
   return sheet;
 }
 
+// ----- Cache tabel -----
+// Isi setiap sheet disimpan sementara di CacheService supaya request baca tidak
+// perlu membuka spreadsheet. Setiap penulisan mengganti "versi" tabel, sehingga
+// cache lama otomatis tidak dipakai lagi. Di dalam lock (saat menulis) data
+// selalu dibaca langsung dari sheet.
+var CACHE_TTL = 21600; // 6 jam (maksimum CacheService)
+var CACHE_CHUNK = 30000; // karakter per potongan (batas 100KB per key)
+var TABLE_MEMO = {};
+var IN_LOCK = false;
+
+function tableVersion_(cache, name) {
+  var key = 'tblver_' + name;
+  var v = cache.get(key);
+  if (!v) {
+    v = newId_();
+    cache.put(key, v, CACHE_TTL);
+  }
+  return v;
+}
+
+function invalidate_(name) {
+  delete TABLE_MEMO[name];
+  try {
+    CacheService.getScriptCache().put('tblver_' + name, newId_(), CACHE_TTL);
+  } catch (e) { /* cache tidak tersedia */ }
+}
+
+function cacheGetChunked_(cache, key) {
+  var n = Number(cache.get(key + '_n') || 0);
+  if (!n) return null;
+  var keys = [];
+  for (var i = 0; i < n; i++) keys.push(key + '_' + i);
+  var parts = cache.getAll(keys);
+  var out = '';
+  for (var j = 0; j < n; j++) {
+    if (typeof parts[keys[j]] !== 'string') return null;
+    out += parts[keys[j]];
+  }
+  return out;
+}
+
+function cachePutChunked_(cache, key, str) {
+  var n = Math.ceil(str.length / CACHE_CHUNK) || 1;
+  if (n > 60) return; // terlalu besar untuk di-cache
+  var obj = {};
+  for (var i = 0; i < n; i++) obj[key + '_' + i] = str.substr(i * CACHE_CHUNK, CACHE_CHUNK);
+  obj[key + '_n'] = String(n);
+  try { cache.putAll(obj, CACHE_TTL); } catch (e) { /* abaikan */ }
+}
+
 function readAll_(name) {
+  if (TABLE_MEMO[name]) return TABLE_MEMO[name].slice();
+  var rows;
+  if (IN_LOCK) {
+    rows = readSheet_(name);
+  } else {
+    var cache = CacheService.getScriptCache();
+    var key = 'tbl_' + name + '_' + tableVersion_(cache, name);
+    var cached = cacheGetChunked_(cache, key);
+    if (cached) {
+      rows = JSON.parse(cached);
+    } else {
+      rows = readSheet_(name);
+      cachePutChunked_(cache, key, JSON.stringify(rows));
+    }
+  }
+  TABLE_MEMO[name] = rows;
+  return rows.slice();
+}
+
+function readSheet_(name) {
   var sheet = getSheet_(name);
   var headers = SCHEMA[name];
   var last = sheet.getLastRow();
@@ -663,15 +767,18 @@ function findRowIndex_(name, id) {
 }
 
 function findById_(name, id) {
-  var row = findRowIndex_(name, id);
-  if (row === -1) return null;
-  var headers = SCHEMA[name];
-  return fromRow_(headers, getSheet_(name).getRange(row, 1, 1, headers.length).getValues()[0]);
+  if (!id) return null;
+  var rows = readAll_(name);
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id === String(id)) return rows[i];
+  }
+  return null;
 }
 
 function insert_(name, obj) {
   var headers = SCHEMA[name];
   getSheet_(name).appendRow(toRow_(headers, obj));
+  invalidate_(name);
   return obj;
 }
 
@@ -683,12 +790,16 @@ function update_(name, id, patch) {
   var current = fromRow_(headers, range.getValues()[0]);
   Object.keys(patch).forEach(function (k) { if (k !== 'id') current[k] = patch[k]; });
   range.setValues([toRow_(headers, current)]);
+  invalidate_(name);
   return current;
 }
 
 function remove_(name, id) {
   var row = findRowIndex_(name, id);
-  if (row !== -1) getSheet_(name).deleteRow(row);
+  if (row !== -1) {
+    getSheet_(name).deleteRow(row);
+    invalidate_(name);
+  }
 }
 
 function toRow_(headers, obj) {
@@ -733,11 +844,15 @@ function seedCategories_() {
 // ---------------------------------------------------------------------------
 
 function withLock_(fn) {
+  if (IN_LOCK) return fn();
   var lock = LockService.getScriptLock();
   lock.waitLock(30000);
+  TABLE_MEMO = {}; // setelah mendapat lock, baca ulang langsung dari sheet
+  IN_LOCK = true;
   try {
     return fn();
   } finally {
+    IN_LOCK = false;
     lock.releaseLock();
   }
 }
@@ -750,6 +865,11 @@ function httpError_(status, message) {
   var err = new Error(message);
   err.status = status;
   return err;
+}
+
+/** ID dari aplikasi (supaya data bisa langsung tampil sebelum tersimpan), atau ID baru. */
+function clientId_(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{8,40}$/.test(id) ? id : newId_();
 }
 
 function newId_() {

@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { api, blobToBase64, downloadBase64 } from '../lib/api'
-import { invalidate, setQueryData, useQuery } from '../lib/query'
+import { api, blobToBase64, downloadBase64, newId } from '../lib/api'
+import { getQueryData, invalidate, setQueryData, useQuery } from '../lib/query'
 import { enqueue, hasPendingFor, pinsKey } from '../lib/outbox'
 import { compressImage, getImageSize } from '../lib/image'
 import { useAuth } from '../store/auth'
@@ -8,20 +8,51 @@ import type { Category, ExcelFile, Pin, Plan, Project, StorageStats, UserProfile
 
 // ---------- Projects ----------
 
+/** Proyek/denah yang sedang disimpan; selama ada, hasil refresh dari server tidak menimpa tampilan. */
+const pendingProjects = new Set<string>()
+const pendingPlans = new Set<string>()
+
 export function useProjects() {
   const user = useAuth((s) => s.user)
-  const q = useQuery<Project[]>(user ? `projects:${user.id}` : null, () => api('listProjects'))
+  const key = user ? `projects:${user.id}` : null
+  const q = useQuery<Project[]>(key, () => api('listProjects'), { hold: () => pendingProjects.size > 0 })
   return {
     projects: q.data ?? [],
     loading: q.loading,
     error: q.error,
+    /** Proyek langsung tampil; penyimpanan ke server berjalan di belakang. */
     createProject: async (name: string) => {
-      const project = await api<Project>('createProject', { name })
-      setQueryData<Project[]>(`projects:${user!.id}`, (prev) => [project, ...(prev ?? [])])
+      if (!user || !key) throw new Error('Not signed in')
+      const id = newId()
+      const draft: Project = {
+        id,
+        name,
+        createdBy: user.id,
+        memberUids: [user.id],
+        createdAt: Date.now(),
+        localPending: true,
+      }
+      pendingProjects.add(id)
+      setQueryData<Project[]>(key, (prev) => [draft, ...(prev ?? [])])
+      try {
+        const saved = await api<Project>('createProject', { id, name })
+        setQueryData<Project[]>(key, (prev) => (prev ?? []).map((p) => (p.id === id ? saved : p)))
+      } catch (e) {
+        setQueryData<Project[]>(key, (prev) => (prev ?? []).filter((p) => p.id !== id))
+        throw e
+      } finally {
+        pendingProjects.delete(id)
+      }
     },
     deleteProject: async (projectId: string) => {
-      setQueryData<Project[]>(`projects:${user!.id}`, (prev) => (prev ?? []).filter((p) => p.id !== projectId))
-      await api('deleteProject', { projectId })
+      if (!key) return
+      setQueryData<Project[]>(key, (prev) => (prev ?? []).filter((p) => p.id !== projectId))
+      try {
+        await api('deleteProject', { projectId })
+      } catch (e) {
+        invalidate(key)
+        throw e
+      }
     },
   }
 }
@@ -30,16 +61,32 @@ export function useProjects() {
 
 export function usePlans(projectId: string | undefined) {
   const key = projectId ? `plans:${projectId}` : null
-  const q = useQuery<Plan[]>(key, () => api('listPlans', { projectId }))
-  const [uploading, setUploading] = useState(false)
+  const q = useQuery<Plan[]>(key, () => api('listPlans', { projectId }), { hold: () => pendingPlans.size > 0 })
+  const patchPlan = (id: string, patch: Partial<Plan>) =>
+    setQueryData<Plan[]>(key!, (prev) => (prev ?? []).map((p) => (p.id === id ? { ...p, ...patch } : p)))
   return {
     plans: q.data ?? [],
     loading: q.loading,
     error: q.error,
-    uploading,
+    /** Denah langsung tampil (dengan tanda "Mengunggah..."); unggahan ke Google Drive berjalan di belakang. */
     uploadPlan: async (name: string, file: File) => {
-      if (!projectId) throw new Error('Missing project')
-      setUploading(true)
+      if (!projectId || !key) throw new Error('Missing project')
+      const id = newId()
+      const draft: Plan = {
+        id,
+        projectId,
+        name,
+        imageFileId: '',
+        imageURL: '',
+        imageWidth: 0,
+        imageHeight: 0,
+        createdBy: useAuth.getState().user?.id ?? '',
+        createdAt: Date.now(),
+        localPending: true,
+      }
+      pendingPlans.add(id)
+      setQueryData<Plan[]>(key, (prev) => [draft, ...(prev ?? [])])
+      let preview = ''
       try {
         let source = file
         if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
@@ -50,7 +97,10 @@ export function usePlans(projectId: string | undefined) {
         }
         const compressed = await compressImage(source, 1.5)
         const { width, height } = await getImageSize(compressed)
-        const plan = await api<Plan>('uploadPlan', {
+        preview = URL.createObjectURL(compressed)
+        patchPlan(id, { imageURL: preview, imageWidth: width, imageHeight: height })
+        const saved = await api<Plan>('uploadPlan', {
+          id,
           projectId,
           name,
           fileName: source.name,
@@ -59,17 +109,50 @@ export function usePlans(projectId: string | undefined) {
           width,
           height,
         })
-        setQueryData<Plan[]>(key!, (prev) => [plan, ...(prev ?? [])])
-        setQueryData<Plan>(`plan:${projectId}:${plan.id}`, () => plan)
+        // Tampilkan gambar lokal dulu, lalu ganti ke gambar Google Drive setelah selesai dimuat (tanpa berkedip).
+        setQueryData<Plan[]>(key, (prev) =>
+          (prev ?? []).map((p) => (p.id === id ? { ...saved, imageURL: preview } : p)),
+        )
+        setQueryData<Plan>(`plan:${projectId}:${id}`, () => saved)
+        swapWhenLoaded(saved.imageURL, () => {
+          patchPlan(id, { imageURL: saved.imageURL })
+          setTimeout(() => URL.revokeObjectURL(preview), 5000)
+        })
+      } catch (e) {
+        setQueryData<Plan[]>(key, (prev) => (prev ?? []).filter((p) => p.id !== id))
+        if (preview) URL.revokeObjectURL(preview)
+        throw e
       } finally {
-        setUploading(false)
+        pendingPlans.delete(id)
       }
     },
     deletePlan: async (planId: string) => {
-      setQueryData<Plan[]>(key!, (prev) => (prev ?? []).filter((p) => p.id !== planId))
-      await api('deletePlan', { projectId, planId })
+      if (!key) return
+      setQueryData<Plan[]>(key, (prev) => (prev ?? []).filter((p) => p.id !== planId))
+      try {
+        await api('deletePlan', { projectId, planId })
+      } catch (e) {
+        invalidate(key)
+        throw e
+      }
     },
   }
+}
+
+function swapWhenLoaded(url: string, swap: () => void) {
+  let done = false
+  const finish = () => {
+    if (!done) {
+      done = true
+      swap()
+    }
+  }
+  const img = new Image()
+  img.referrerPolicy = 'no-referrer'
+  img.onload = finish
+  img.onerror = finish
+  img.src = url
+  setTimeout(finish, 20000)
 }
 
 export function usePlan(projectId: string | undefined, planId: string | undefined) {
@@ -78,7 +161,9 @@ export function usePlan(projectId: string | undefined, planId: string | undefine
     () => api('getPlan', { projectId, planId }),
     { refetchInterval: 0 },
   )
-  return { plan: q.data ?? null, error: q.error }
+  // Pakai data dari daftar denah yang sudah dimuat, supaya denah langsung tampil.
+  const fromList = projectId ? getQueryData<Plan[]>(`plans:${projectId}`)?.find((p) => p.id === planId) : undefined
+  return { plan: q.data ?? fromList ?? null, error: q.data || fromList ? null : q.error }
 }
 
 // ---------- Pins ----------
@@ -99,7 +184,7 @@ export function usePins(projectId: string | undefined, planId: string | undefine
     loading: q.loading,
     createPin: async (x: number, y: number) => {
       if (!user) throw new Error('Not signed in')
-      const id = crypto.randomUUID().replace(/-/g, '').slice(0, 20)
+      const id = newId()
       const now = Date.now()
       const pin: Pin = {
         id,
@@ -174,7 +259,9 @@ export function useAdminUsers() {
     users: q.data ?? [],
     loading: q.loading,
     setUserRole: async (userId: string, role: UserProfile['role']) => {
-      setQueryData<UserProfile[]>('admin:users', (prev) => (prev ?? []).map((u) => (u.id === userId ? { ...u, role } : u)))
+      setQueryData<UserProfile[]>('admin:users', (prev) =>
+        (prev ?? []).map((u) => (u.id === userId ? { ...u, role } : u)),
+      )
       await api('adminSetUserRole', { userId, role })
     },
     deleteUser: async (userId: string) => {

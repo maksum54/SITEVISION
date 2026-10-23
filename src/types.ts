@@ -17,6 +17,8 @@ export interface Project {
   createdBy: string
   memberUids: string[]
   createdAt: number
+  /** Hanya di sisi klien: belum tersimpan di server. */
+  localPending?: boolean
 }
 
 export interface Plan {
@@ -29,6 +31,8 @@ export interface Plan {
   imageHeight: number
   createdBy: string
   createdAt: number
+  /** Hanya di sisi klien: masih diunggah ke Google Drive. */
+  localPending?: boolean
 }
 
 export interface Pin {
